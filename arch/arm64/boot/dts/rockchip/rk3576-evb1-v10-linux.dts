@@ -8,10 +8,208 @@
 
 #include "rk3576.dtsi"
 #include "rk3576-evb1.dtsi"
-#include "rk3576-evb1-cam-dcphy0.dtsi"
+
 #include "rk3576-linux.dtsi"
 
 / {
 	model = "Rockchip RK3576 EVB1 V10 Board";
 	compatible = "rockchip,rk3576-evb1-v10", "rockchip,rk3576";
+
+    pdmics: dummy-codec {
+        status = "okay";
+        compatible = "rockchip,dummy-codec";
+        #sound-dai-cells = <0>;
+    };
+
+    pdm_mic_array: pdm-mic-array {
+        status = "okay";
+        compatible = "simple-audio-card";
+        simple-audio-card,name = "rockchip,pdm-mic-array";
+        simple-audio-card,cpu {
+            sound-dai = <&pdm0>;
+        };
+        simple-audio-card,codec {
+            sound-dai = <&pdmics>;
+        };
+    };  
+};
+
+/**********pwm-fan**********/
+
+&pwm1_6ch_5 {
+    status = "okay";
+    pinctrl-0 = <&pwm1m1_ch5>;
+};
+
+/**********3PIN SPI呼吸灯**********/
+
+&spi4 {
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = <&spi4m3_csn0 &spi4m3_pins>;
+    
+    
+    #address-cells = <1>;
+    #size-cells = <0>;
+
+    // 定义 SPI 设备：片选 0，生成 /dev/spidev4.0
+    spidev@0 {
+        compatible = "rockchip,spidev";   // 使驱动匹配的兼容字符串，也可用 "spidev"
+        reg = <0>;                         // 片选号（0 对应 CS0）
+        spi-max-frequency = <12000000>;     // 设置最大 SPI 时钟频率（单位 Hz），根据实际调整
+        status = "okay";
+    };
+
+};
+
+/**********PDM麦克风阵列**********/
+
+&pdm0 {
+    status = "okay";
+        pinctrl-names = "default", "idle", "clk";
+        pinctrl-0 = <&pdm0m0_sdi0
+                 &pdm0m0_sdi1>;
+        pinctrl-1 = <&pdm0m0_clk0_idle
+                 &pdm0m0_clk1_idle>;
+        pinctrl-2 = <&pdm0m0_clk0
+                 &pdm0m0_clk1>;
+};
+
+/**********HDMI IN-RK628F*********/
+
+&i2c0 {
+    status = "okay";
+    pinctrl-0 = <&i2c0m1_xfer>;
+    clock-frequency = <400000>;
+
+    rk628_csi: rk628_csi@50 {
+        reg = <0x50>;
+        compatible = "rockchip,rk628-csi-v4l2";
+        status = "okay";
+        power-domains = <&power RK3576_PD_VI>;
+        pinctrl-names = "default";
+        pinctrl-0 = <&rk628_pin>;
+        interrupt-parent = <&gpio2>;
+        interrupts = <RK_PD3 IRQ_TYPE_LEVEL_HIGH>;
+        enable-gpios = <&gpio2 RK_PD4 GPIO_ACTIVE_HIGH>;
+        reset-gpios = <&gpio2 RK_PD2 GPIO_ACTIVE_LOW>;
+        plugin-det-gpios = <&gpio2 RK_PD5 GPIO_ACTIVE_LOW>;
+        continues-clk = <1>;
+        cec-enable;
+        #sound-dai-cells = <0>;
+
+        rockchip,camera-module-index = <0>;
+        rockchip,camera-module-facing = "back";
+        rockchip,camera-module-name = "HDMI-MIPI1";
+        rockchip,camera-module-lens-name = "RK628-CSI";
+
+        
+
+        port {
+            hdmiin_out: endpoint {
+                remote-endpoint = <&hdmi_mipi_in>;
+                data-lanes = <1 2 3 4>;
+            };
+        };
+    };
+};
+
+/*-----------------------------------------------------------------------*/
+
+&csi2_dphy1 {
+    status = "okay";
+
+    ports {
+        #address-cells = <1>;
+        #size-cells = <0>;
+        port@0 {
+            reg = <0>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            hdmi_mipi_in: endpoint@1 {
+                reg = <1>;
+                remote-endpoint = <&hdmiin_out>;
+                data-lanes = <1 2 3 4>;
+            };
+        
+
+        };
+        port@1 {
+            reg = <1>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            csidphy1_out: endpoint@0 {
+                reg = <0>;
+                remote-endpoint = <&mipi1_csi2_input>;
+            };
+        };
+    };
+};
+
+/*-----------------------------------------------------------------------*/
+
+&mipi1_csi2 {
+    status = "okay";
+
+    ports {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        port@0 {
+            reg = <0>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            mipi1_csi2_input: endpoint@1 {
+                reg = <1>;
+                remote-endpoint = <&csidphy1_out>;
+            };
+        };
+
+        port@1 {
+            reg = <1>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            mipi1_csi2_output: endpoint@0 {
+                reg = <0>;
+                remote-endpoint = <&cif_mipi_in1>;
+            };
+        };
+    };
+};
+
+/*-----------------------------------------------------------------------*/
+
+&rkcif_mipi_lvds1 {
+    status = "okay";
+
+    port {
+        cif_mipi_in1: endpoint {
+            remote-endpoint = <&mipi1_csi2_output>;
+        };
+    };
+};
+
+/*-----------------------------------------------------------------------*/
+
+&rkcif {
+    status = "okay";
+};
+
+&rkcif_mmu {
+    status = "okay";
+};
+
+&pinctrl {
+    hdmiin {
+        rk628_pin: rk628-pin {
+            rockchip,pins = <2 RK_PD3 RK_FUNC_GPIO &pcfg_pull_none>,
+                    <2 RK_PD4 RK_FUNC_GPIO &pcfg_pull_none>,
+                    <2 RK_PD2 RK_FUNC_GPIO &pcfg_pull_none>,
+                    <2 RK_PD5 RK_FUNC_GPIO &pcfg_pull_none>;
+        };
+    };
 };

@@ -12,6 +12,13 @@ menuconfig INPUT_TOUCHSCREEN
 
 if INPUT_TOUCHSCREEN
 
+config TOUCHSCREEN_SW42000
+    tristate "sw42000 touchpad driver"
+    help
+      sw42000 touchpad driver 
+
+
+
 config TOUCHSCREEN_88PM860X
 	tristate "Marvell 88PM860x touchscreen"
 	depends on MFD_88PM860X
