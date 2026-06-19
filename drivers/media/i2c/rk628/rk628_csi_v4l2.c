@@ -111,6 +111,7 @@ struct rk628_csi {
 	int plugin_irq;
 	int lock_fail_time;
 	bool nosignal;
+	bool dv_no5v_logged;	/* dedup "not detect 5v" log in query_dv_timings */
 	bool rxphy_pwron;
 	bool txphy_pwron;
 	bool enable_hdcp;
@@ -2030,9 +2031,19 @@ static int rk628_csi_query_dv_timings(struct v4l2_subdev *sd,
 
 	if (!tx_5v_power_present(sd) || csi->nosignal) {
 		*timings = default_timing;
-		v4l2_info(sd, "%s: not detect 5v, set default timing\n", __func__);
+		/*
+		 * Userspace polls QUERY_DV_TIMINGS continuously; without
+		 * dedup this v4l2_info() floods the log (~170k lines/day on
+		 * an idle device, enough to wear out the eMMC). Log only on
+		 * the no-signal edge and re-arm once signal returns.
+		 */
+		if (!csi->dv_no5v_logged) {
+			v4l2_info(sd, "%s: not detect 5v, set default timing\n", __func__);
+			csi->dv_no5v_logged = true;
+		}
 		return 0;
 	}
+	csi->dv_no5v_logged = false;
 	mutex_lock(&csi->confctl_mutex);
 	ret = rk628_csi_get_detected_timings(sd, timings);
 	mutex_unlock(&csi->confctl_mutex);
