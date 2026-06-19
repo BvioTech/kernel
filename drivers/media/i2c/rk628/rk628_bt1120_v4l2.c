@@ -92,6 +92,7 @@ struct rk628_bt1120 {
 	int plugin_irq;
 	int lock_fail_time;
 	bool nosignal;
+	bool dv_no5v_logged;	/* dedup "not detect 5v" log in query_dv_timings */
 	bool rxphy_pwron;
 	bool enable_hdcp;
 	bool scaler_en;
@@ -1254,9 +1255,14 @@ static int rk628_bt1120_query_dv_timings(struct v4l2_subdev *sd,
 
 	if (!tx_5v_power_present(sd) || bt1120->nosignal) {
 		*timings = default_timing;
-		v4l2_info(sd, "%s: not detect 5v, set default timing\n", __func__);
+		/* dedup: see rk628_csi_query_dv_timings — avoid per-poll log spam */
+		if (!bt1120->dv_no5v_logged) {
+			v4l2_info(sd, "%s: not detect 5v, set default timing\n", __func__);
+			bt1120->dv_no5v_logged = true;
+		}
 		return 0;
 	}
+	bt1120->dv_no5v_logged = false;
 	ret = rk628_bt1120_get_detected_timings(sd, timings);
 	if (ret)
 		return ret;
