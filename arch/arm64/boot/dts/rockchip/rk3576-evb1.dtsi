@@ -38,7 +38,16 @@
             "LINPUT1", "Main Mic",
             
             "RINPUT1", "Headset Mic",
-            "RINPUT2", "Headset Mic";
+            "RINPUT2", "Headset Mic",
+            /*
+             * ES8388 "Mic Bias" is a DAPM supply widget with no kcontrol
+             * (PdnMICB). Without a route it stays powered down and the mic
+             * is dead. Route the mic input pins to it so DAPM powers the
+             * bias whenever a capture path is active.
+             */
+            "LINPUT1", "Mic Bias",
+            "RINPUT1", "Mic Bias",
+            "RINPUT2", "Mic Bias";
         pinctrl-names = "default";
         pinctrl-0 = <&hp_det>;
         play-pause-key {
