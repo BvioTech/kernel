@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2026 BvioTech Co., Ltd.
+ *
+ * VLA11 (RK3576), based on the Rockchip EVB1 V10 design.
+ * Hardware description is inherited from rk3576-evb1-v10-linux.dts;
+ * only the model identity is overridden. Keep "compatible" unchanged
+ * so u-boot FIT matching and driver quirks are unaffected.
+ */
+
+#include "rk3576-evb1-v10-linux.dts"
+
+/ {
+	model = "BvioTech VLA11 (RK3576)";
+};
