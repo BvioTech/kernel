@@ -1995,6 +1995,10 @@ static int dw_mipi_dsi2_probe(struct platform_device *pdev)
 
 static int dw_mipi_dsi2_remove(struct platform_device *pdev)
 {
+	struct dw_mipi_dsi2 *dsi2 = platform_get_drvdata(pdev);
+
+	mipi_dsi_host_unregister(&dsi2->host);
+
 	return 0;
 }
 
