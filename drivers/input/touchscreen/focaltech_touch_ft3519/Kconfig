@@ -1,0 +1,9 @@
+#
+# Focaltech Touchscreen driver configuration
+#
+
+config TOUCHSCREEN_FT3519
+	tristate "FocalTech FT3519 touchscreen"
+	depends on I2C
+	help
+	  Vendor driver for the FT3519 controller.

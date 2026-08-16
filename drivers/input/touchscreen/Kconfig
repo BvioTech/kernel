@@ -391,6 +391,14 @@ config TOUCHSCREEN_FTS
 	  Say Y here if you have Focaltech touch panel.
 	  If unsure, say N.
 
+config TOUCHSCREEN_FT3519
+	tristate "FocalTech FT3519 touchscreen"
+	depends on I2C
+	select INPUT_MT
+	help
+	  Say Y here to enable the vendor driver for the FocalTech FT3519
+	  controller fitted to the FPT TTCM03921235 display module.
+
 config TOUCHSCREEN_FT5726
 	tristate "Focaltech Touchscreen FT5726"
 	depends on I2C
