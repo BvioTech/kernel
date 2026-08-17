@@ -16,6 +16,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
+#include <linux/string.h>
 #include <linux/mfd/syscon.h>
 #include <linux/phy/phy.h>
 
@@ -36,6 +37,16 @@
 
 #include "rockchip_drm_drv.h"
 #include "rockchip_drm_vop.h"
+
+#if IS_REACHABLE(CONFIG_DRM_PANEL_JUJING_JN3929595A)
+int panel_jujing_jn3929595a_loader_protect(struct drm_panel *panel);
+#else
+static inline int
+panel_jujing_jn3929595a_loader_protect(struct drm_panel *panel)
+{
+	return 0;
+}
+#endif
 
 #define UPDATE(v, h, l)			(((v) << (l)) & GENMASK((h), (l)))
 
@@ -1171,8 +1182,14 @@ static int dw_mipi_dsi2_encoder_loader_protect(struct drm_encoder *encoder,
 {
 	struct dw_mipi_dsi2 *dsi2 = encoder_to_dsi2(encoder);
 
-	if (dsi2->panel)
+	/* panel_simple_loader_protect() performs a private container cast. */
+	if (dsi2->panel && dsi2->panel->dev->driver &&
+	    !strcmp(dsi2->panel->dev->driver->name, "panel-simple-dsi"))
 		panel_simple_loader_protect(dsi2->panel);
+	else if (on && dsi2->panel && dsi2->panel->dev->driver &&
+		 !strcmp(dsi2->panel->dev->driver->name,
+			 "panel-jujing-jn3929595a"))
+		panel_jujing_jn3929595a_loader_protect(dsi2->panel);
 
 	dw_mipi_dsi2_loader_protect(dsi2, on);
 

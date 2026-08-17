@@ -399,6 +399,15 @@ config TOUCHSCREEN_FT3519
 	  Say Y here to enable the vendor driver for the FocalTech FT3519
 	  controller fitted to the FPT TTCM03921235 display module.
 
+config TOUCHSCREEN_HYN_CST3640
+	tristate "Hynitron CST3640 touchscreen"
+	depends on I2C && OF
+	select INPUT_MT
+	help
+	  Say Y here to enable Hynitron's CST3640 I2C touchscreen driver.
+	  The TL V4 board enables this device only when its LCD-ID ADC value
+	  selects the Jujing JN3929595A display module.
+
 config TOUCHSCREEN_FT5726
 	tristate "Focaltech Touchscreen FT5726"
 	depends on I2C

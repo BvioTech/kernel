@@ -170,6 +170,16 @@ config DRM_PANEL_FPT_TTCM03921235
 	  TTCM03921235 AMOLED module with a factory-programmed CH13726A
 	  display controller.
 
+config DRM_PANEL_JUJING_JN3929595A
+	tristate "Jujing JN3929595A AMOLED panel"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  Say Y here to enable the dedicated driver for the 1080x1240 Jujing
+	  JN3929595A AMOLED module with a factory-programmed CH13726A display
+	  controller.
+
 config DRM_PANEL_ILITEK_IL9322
 	tristate "Ilitek ILI9322 320x240 QVGA panels"
 	depends on OF && SPI

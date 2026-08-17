@@ -310,6 +310,31 @@
 		pinctrl-0 = <&ft3519_reset &ft3519_irq>;
 		panel = <&dsi_panel>;
 	};
+
+	cst3640: touchscreen@58 {
+		compatible = "hyn,cst3640";
+		reg = <0x58>;
+		status = "disabled";
+
+		interrupt-parent = <&gpio4>;
+		interrupts = <RK_PA1 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&gpio4 RK_PA0 GPIO_ACTIVE_LOW>;
+		irq-gpios = <&gpio4 RK_PA1 GPIO_ACTIVE_HIGH>;
+		vdd_ana-supply = <&vcc_3v3_s0>;
+		vcc_i2c-supply = <&vcc_1v8_s0>;
+
+		max-touch-number = <10>;
+		pos-swap = <0>;
+		posx-reverse = <0>;
+		posy-reverse = <0>;
+		display-coords = <0 0 1079 1239>;
+		panel = <&dsi_panel>;
+		wakeup-source;
+
+		pinctrl-names = "ts_active", "ts_suspend";
+		pinctrl-0 = <&ft3519_reset &ft3519_irq>;
+		pinctrl-1 = <&ft3519_reset &ft3519_irq>;
+	};
 };
 
 /**********WIFI 蓝牙**********/
