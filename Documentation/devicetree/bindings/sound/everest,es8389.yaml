@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/everest,es8389.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Everest ES8389 and ES8390 audio CODECs
+
+description: |
+  The ES8390 uses the ES8389 register and digital-audio interface and is
+  controlled by the same driver.  Boards containing an ES8390 therefore use
+  the everest,es8389 compatible string.
+
+maintainers:
+  - Michael Zhang <zhangyi@everest-semi.com>
+
+allOf:
+  - $ref: dai-common.yaml#
+
+properties:
+  compatible:
+    const: everest,es8389
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    items:
+      - description: clock for master clock (MCLK)
+
+  clock-names:
+    items:
+      - const: mclk
+
+  port:
+    $ref: audio-graph-port.yaml#
+    unevaluatedProperties: false
+
+  "#sound-dai-cells":
+    const: 0
+
+  vdda-supply:
+    description:
+      Analogue power supply.
+
+  vddd-supply:
+    description:
+      Interface power supply.
+
+  everest,mclk-src:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 1
+    description:
+      Master-clock source selector.  Zero selects the MCLK pin and one selects
+      the serial bit-clock pin.
+
+  everest,adc-slot:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 7
+    description: ADC TDM slot number.
+
+  everest,dac-slot:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 7
+    description: DAC TDM slot number.
+
+  everest,dmic-enabled:
+    type: boolean
+    description: Use the digital microphone input instead of the analogue input.
+
+  everest,invert-right-output:
+    type: boolean
+    description:
+      Invert the right DAC output polarity.  This is used by boards that feed
+      a differential mono power amplifier from LOUT2 and ROUT2.
+
+  everest,dac-playback-volume:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 255
+    description: |
+      Initial left and right DAC digital playback volume.  Each step is 0.5 dB
+      starting at -95.5 dB; value 191 is 0 dB.  The value is restored after
+      codec initialization and resume.
+
+required:
+  - compatible
+  - reg
+  - "#sound-dai-cells"
+  - vddd-supply
+  - vdda-supply
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+      #address-cells = <1>;
+      #size-cells = <0>;
+      es8389: codec@10 {
+        compatible = "everest,es8389";
+        reg = <0x10>;
+        #sound-dai-cells = <0>;
+        vddd-supply = <&vdd3v3>;
+        vdda-supply = <&vdd3v3>;
+        everest,dac-playback-volume = <179>;
+      };
+    };

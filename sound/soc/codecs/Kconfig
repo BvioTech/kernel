@@ -100,6 +100,7 @@ config SND_SOC_ALL_CODECS
 	imply SND_SOC_DUMMY_CODEC
 	imply SND_SOC_ES8316
 	imply SND_SOC_ES8323
+	imply SND_SOC_ES8389
 	imply SND_SOC_ES8326
 	imply SND_SOC_ES8328_SPI
 	imply SND_SOC_ES8328_I2C
@@ -979,6 +980,14 @@ config SND_SOC_ES8316
 config SND_SOC_ES8323
 	tristate "Everest Semi ES8323 CODEC"
 	depends on I2C
+
+config SND_SOC_ES8389
+	tristate "Everest Semi ES8389/ES8390 CODEC"
+	depends on I2C
+	help
+	  Enable support for the Everest Semi ES8389 and ES8390 audio
+	  codecs. The two parts use the ES8389 register interface and
+	  driver; this is not compatible with the ES8388/ES8323 driver.
 
 config SND_SOC_ES8326
 	tristate "Everest Semi ES8326 CODEC"
