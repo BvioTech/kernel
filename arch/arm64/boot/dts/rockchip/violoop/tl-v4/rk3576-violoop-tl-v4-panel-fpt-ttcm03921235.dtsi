@@ -1,0 +1,81 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * FPT TTCM03921235 AMOLED module
+ * Display controller: Chip Wealth CH13726A (factory programmed)
+ * Touch controller: FocalTech FT3519 (described in the TL V4 base DTSI)
+ *
+ * Keep the complete panel description in this TL V4-only DTSI.  The
+ * Rockchip DSI2 loader-logo path is hard-wired to panel-simple, so using the
+ * generic DSI panel implementation here is required for a safe handoff from
+ * U-Boot without changing shared Rockchip display code.
+ */
+
+&dsi {
+	dsi_panel: panel@0 {
+		compatible = "fpt,ttcm03921235", "simple-panel-dsi";
+		reg = <0>;
+		status = "okay";
+
+		prepare-delay-ms = <15>;
+		reset-delay-ms = <10>;
+		init-delay-ms = <10>;
+		enable-delay-ms = <0>;
+		disable-delay-ms = <0>;
+		unprepare-delay-ms = <5>;
+
+		width-mm = <65>;
+		height-mm = <76>;
+		bpc = <8>;
+
+		dsi,flags = <0xa00>;
+		dsi,format = <0>;
+		dsi,lanes = <4>;
+
+		rockchip,dcs-backlight-byte;
+		rockchip,dcs-backlight-max = <255>;
+		rockchip,dcs-display-control;
+
+		panel-init-sequence = [
+			05 78 01 11
+			05 28 01 29
+		];
+
+		panel-exit-sequence = [
+			05 00 01 28
+			05 78 01 10
+		];
+
+		display-timings {
+			native-mode = <&ttcm03921235_timing>;
+
+			ttcm03921235_timing: timing0 {
+				clock-frequency = <84296640>;
+				hactive = <1080>;
+				hfront-porch = <12>;
+				hsync-len = <4>;
+				hback-porch = <12>;
+				vactive = <1240>;
+				vfront-porch = <12>;
+				vsync-len = <4>;
+				vback-porch = <12>;
+				hsync-active = <0>;
+				vsync-active = <0>;
+				de-active = <0>;
+				pixelclk-active = <0>;
+			};
+		};
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				panel_in_dsi: endpoint {
+					remote-endpoint = <&dsi_out_panel>;
+				};
+			};
+		};
+	};
+};

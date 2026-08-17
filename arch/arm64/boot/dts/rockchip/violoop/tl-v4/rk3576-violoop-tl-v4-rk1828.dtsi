@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Violoop TL V4 RK1828 PCIe endpoint.
+ *
+ * VAL11 routes PCIe0/ComboPHY0 to the M.2 M-Key socket. GPIO4_C6 enables
+ * both the socket 3.3 V rail and VCC12V_PCIE0; the latter also powers the
+ * fan header, so the rail must not be power-cycled as an RK1828-only supply.
+ */
+
+&vcc3v3_m2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&rk1828_power_enable>;
+	startup-delay-us = <5000>;
+};
+
+&combphy0_ps {
+	status = "okay";
+};
+
+/*
+ * GPIO2_B0 is PERST# on the VAL11 M.2 socket.  The disabled HDMI node in
+ * the original TL V4 board description retained the same GPIO as an enable
+ * line; remove that stale ownership so the compiled tree has one owner.
+ */
+&hdmi {
+	/delete-property/ enable-gpios;
+};
+
+&pcie0 {
+	/* GPIO_ACTIVE_HIGH makes logical 0 assert the board's active-low PERST#. */
+	reset-gpios = <&gpio2 RK_PB0 GPIO_ACTIVE_HIGH>;
+	vpcie3v3-supply = <&vcc3v3_m2>;
+	max-link-speed = <2>;
+	rockchip,perst-inactive-ms = <200>;
+	supports-clkreq;
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie0m0_pins
+		     &rk1828_perst
+		     &rk1828_wake>;
+	status = "okay";
+};
+
+/* VAL11 routes the populated M.2 socket to PCIe0, not PCIe1. */
+&pcie1 {
+	status = "disabled";
+};
+
+&pinctrl {
+	rk1828-pcie0 {
+		rk1828_perst: rk1828-perst {
+			rockchip,pins = <2 RK_PB0 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+
+		/* PEWAKE# is wired but has no separate Rockchip RC IRQ consumer. */
+		rk1828_wake: rk1828-wake {
+			rockchip,pins = <2 RK_PB1 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+
+		rk1828_power_enable: rk1828-power-enable {
+			rockchip,pins = <4 RK_PC6 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+	};
+};

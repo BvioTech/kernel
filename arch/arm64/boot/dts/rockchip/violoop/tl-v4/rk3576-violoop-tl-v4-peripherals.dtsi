@@ -1,0 +1,348 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Violoop TL V4 product peripherals.
+ *
+ * Optional devices populated on the complete TL V4 product.
+ */
+
+/ {
+    pdmics: dummy-codec {
+        status = "okay";
+        compatible = "rockchip,dummy-codec";
+        #sound-dai-cells = <0>;
+    };
+
+    pdm_mic_array: pdm-mic-array {
+        status = "okay";
+        compatible = "simple-audio-card";
+        simple-audio-card,name = "rockchip,pdm-mic-array";
+        simple-audio-card,cpu {
+            sound-dai = <&pdm0>;
+        };
+        simple-audio-card,codec {
+            sound-dai = <&pdmics>;
+        };
+    };
+
+};
+
+/**********Violoop userspace fan control**********/
+
+&pwm1_6ch_5 {
+    /*
+     * PWM1_CH5_M1 drives the fan input on GPIO4_C0.  Do not bind the
+     * kernel pwm-fan consumer here: violoop-thermald owns pwmchip1/pwm0
+     * and applies the product fan curve in userspace.
+     */
+    status = "okay";
+    pinctrl-0 = <&pwm1m1_ch5>;
+};
+
+/**********3PIN SPI呼吸灯**********/
+
+&spi4 {
+    status = "okay";
+    pinctrl-names = "default";
+    /*
+     * The 3-wire WS2812 strip only uses MOSI.  Do not request CS0 here:
+     * SPI4_M3_CSN0 is GPIO2_B2, shared with PCIe0 CLKREQ# on TL V4.
+     * Userspace sets SPI_NO_CS for transfers.
+     */
+    pinctrl-0 = <&spi4m3_pins>;
+
+
+    #address-cells = <1>;
+    #size-cells = <0>;
+
+    // 定义 SPI 设备：片选 0，生成 /dev/spidev4.0
+    spidev@0 {
+        compatible = "rockchip,spidev";   // 使驱动匹配的兼容字符串，也可用 "spidev"
+        reg = <0>;                         // 片选号（0 对应 CS0）
+        spi-max-frequency = <12000000>;
+        status = "okay";
+    };
+
+};
+
+/**********PDM麦克风阵列**********/
+
+&pdm0 {
+    status = "okay";
+        pinctrl-names = "default", "idle", "clk";
+        pinctrl-0 = <&pdm0m0_sdi0
+                 &pdm0m0_sdi1>;
+        pinctrl-1 = <&pdm0m0_clk0_idle
+                 &pdm0m0_clk1_idle>;
+        pinctrl-2 = <&pdm0m0_clk0
+                 &pdm0m0_clk1>;
+};
+
+/**********HDMI IN-RK628F*********/
+
+&i2c0 {
+    status = "okay";
+    pinctrl-0 = <&i2c0m1_xfer>;
+    clock-frequency = <400000>;
+
+    rk628_csi: rk628_csi@50 {
+        reg = <0x50>;
+        compatible = "rockchip,rk628-csi-v4l2";
+        status = "okay";
+        power-domains = <&power RK3576_PD_VI>;
+        pinctrl-names = "default";
+        pinctrl-0 = <&rk628_pin>;
+        interrupt-parent = <&gpio2>;
+		/* VAL11 TL V4: D2=RESET, D3=INT, D4=PWR_EN, D5=Plugin_DET. */
+		interrupts = <RK_PD3 IRQ_TYPE_LEVEL_HIGH>;
+		enable-gpios = <&gpio2 RK_PD4 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&gpio2 RK_PD2 GPIO_ACTIVE_LOW>;
+		plugin-det-gpios = <&gpio2 RK_PD5 GPIO_ACTIVE_LOW>;
+        continues-clk = <1>;
+        /*
+         * TL V4 validation: leave CEC disabled while the RK628H reports an
+         * I2C failure at HDMI_RX_CEC_RX_CNT (0x31f20).  CEC is independent
+         * of the HDMI-to-CSI video path and a stuck CEC interrupt must not
+         * hold the shared level-high INT line asserted.
+         */
+        #sound-dai-cells = <0>;
+
+        rockchip,camera-module-index = <0>;
+        rockchip,camera-module-facing = "back";
+        rockchip,camera-module-name = "HDMI-MIPI1";
+        rockchip,camera-module-lens-name = "RK628-CSI";
+
+
+
+        port {
+            hdmiin_out: endpoint {
+                remote-endpoint = <&hdmi_mipi_in>;
+                data-lanes = <1 2 3 4>;
+            };
+        };
+    };
+};
+
+/*-----------------------------------------------------------------------*/
+
+&csi2_dphy1 {
+    status = "okay";
+
+    ports {
+        #address-cells = <1>;
+        #size-cells = <0>;
+        port@0 {
+            reg = <0>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            hdmi_mipi_in: endpoint@1 {
+                reg = <1>;
+                remote-endpoint = <&hdmiin_out>;
+                data-lanes = <1 2 3 4>;
+            };
+
+
+        };
+        port@1 {
+            reg = <1>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            csidphy1_out: endpoint@0 {
+                reg = <0>;
+                remote-endpoint = <&mipi1_csi2_input>;
+            };
+        };
+    };
+};
+
+/*-----------------------------------------------------------------------*/
+
+&mipi1_csi2 {
+    status = "okay";
+
+    ports {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        port@0 {
+            reg = <0>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            mipi1_csi2_input: endpoint@1 {
+                reg = <1>;
+                remote-endpoint = <&csidphy1_out>;
+            };
+        };
+
+        port@1 {
+            reg = <1>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            mipi1_csi2_output: endpoint@0 {
+                reg = <0>;
+                remote-endpoint = <&cif_mipi_in1>;
+            };
+        };
+    };
+};
+
+/*-----------------------------------------------------------------------*/
+
+&rkcif_mipi_lvds1 {
+    status = "okay";
+
+    port {
+        cif_mipi_in1: endpoint {
+            remote-endpoint = <&mipi1_csi2_output>;
+        };
+    };
+};
+
+/*-----------------------------------------------------------------------*/
+
+&rkcif {
+    status = "okay";
+};
+
+&rkcif_mmu {
+    status = "okay";
+};
+
+&pinctrl {
+    hdmiin {
+        rk628_pin: rk628-pin {
+			rockchip,pins = <2 RK_PD2 RK_FUNC_GPIO &pcfg_pull_none>,
+					<2 RK_PD3 RK_FUNC_GPIO &pcfg_pull_none>,
+					<2 RK_PD4 RK_FUNC_GPIO &pcfg_pull_none>,
+					<2 RK_PD5 RK_FUNC_GPIO &pcfg_pull_none>;
+        };
+    };
+
+	lt7911exc {
+		lt7911exc_ctrl: lt7911exc-ctrl {
+			/* GPIO0_B4 is LT_RST; GPIO0_B5 receives active-low INT_GPIO11. */
+			rockchip,pins = <0 RK_PB4 RK_FUNC_GPIO &pcfg_pull_none>,
+					<0 RK_PB5 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+};
+
+/**********Type-C/DP input through LT7911EXC to CSI3**********/
+
+/*
+ * TL V4 connects I2C8 M2, GPIO0_B4 LT_RST, GPIO0_B5 INT_GPIO11 and four
+ * CSI3 data lanes to the bridge.
+ */
+&i2c8 {
+	/* Some early LT7911EXC revisions only answer at the default 100 kHz. */
+	clock-frequency = <100000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c8m2_xfer>;
+	status = "okay";
+
+	lt7911exc: lt7911exc@41 {
+		compatible = "lontium,lt7911exc";
+		reg = <0x41>;
+		interrupt-parent = <&gpio0>;
+		interrupts = <RK_PB5 IRQ_TYPE_EDGE_FALLING>;
+		/* R47 (68K) pulls RST_N to 3.3 V; the SoC only sinks or releases it. */
+		reset-gpios = <&gpio0 RK_PB4
+				 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
+		/* R47/C71 form a 68 ms RC; allow reset to rise and firmware to boot. */
+		lontium,reset-release-delay-ms = <100>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&lt7911exc_ctrl>;
+		rockchip,camera-module-index = <1>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "TYPEC-DP-MIPI-CSI3";
+		rockchip,camera-module-lens-name = "LT7911EXC";
+		/* LT7911EXC firmware is programmed; enable the complete CSI3 bridge. */
+		status = "okay";
+
+		port {
+			lt7911exc_out: endpoint {
+				bus-type = <4>;
+				data-lanes = <1 2 3 4>;
+				remote-endpoint = <&lt7911exc_csi3_in>;
+			};
+		};
+	};
+};
+
+/* CSI3 is used in its complete four-lane mode; split DPHY4/5 stay disabled. */
+&csi2_dphy3 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			lt7911exc_csi3_in: endpoint@1 {
+				reg = <1>;
+				bus-type = <4>;
+				data-lanes = <1 2 3 4>;
+				remote-endpoint = <&lt7911exc_out>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			csi3_dphy_out: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&mipi3_csi2_input>;
+			};
+		};
+	};
+};
+
+&mipi3_csi2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi3_csi2_input: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&csi3_dphy_out>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi3_csi2_output: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&cif_mipi3_in>;
+			};
+		};
+	};
+};
+
+&rkcif_mipi_lvds3 {
+	status = "okay";
+
+	port {
+		cif_mipi3_in: endpoint {
+			remote-endpoint = <&mipi3_csi2_output>;
+		};
+	};
+};

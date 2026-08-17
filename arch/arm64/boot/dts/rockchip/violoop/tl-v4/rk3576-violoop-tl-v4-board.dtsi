@@ -1,0 +1,424 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2024 Rockchip Electronics Co., Ltd.
+ *
+ */
+
+#include <dt-bindings/usb/pd.h>
+#include "../../rk3576-rk806.dtsi"
+
+/ {
+	es8389_sound: es8389-sound {
+        status = "okay";
+        compatible = "rockchip,multicodecs-card";
+		/* Keep the legacy ALSA card ID expected by Violoop userspace. */
+		rockchip,card-name = "rockchip-es8388";
+        hp-det-gpio = <&gpio4 RK_PB0 GPIO_ACTIVE_LOW>;
+        io-channels = <&saradc 3>;
+        io-channel-names = "adc-detect";
+        keyup-threshold-microvolt = <1800000>;
+        poll-interval = <100>;
+        spk-con-gpio = <&gpio2 RK_PD0 GPIO_ACTIVE_HIGH>;
+        //hp-con-gpio = <&gpio3 RK_PD6 GPIO_ACTIVE_HIGH>;
+		/* Keep the PA muted until the codec output is stable. */
+		rockchip,pre-power-on-delay-ms = <150>;
+		rockchip,post-power-down-delay-ms = <80>;
+        rockchip,format = "i2s";
+        rockchip,mclk-fs = <256>;
+        rockchip,cpu = <&sai1>;
+        rockchip,codec = <&es8389>;
+        rockchip,audio-routing =
+            "Speaker", "HPOL",
+            "Speaker", "HPOR",
+            "Speaker", "Speaker Power",
+            "INPUT1", "Main Mic",
+            "INPUT2", "Headset Mic";
+        pinctrl-names = "default";
+        pinctrl-0 = <&hp_det>;
+        play-pause-key {
+            label = "playpause";
+            linux,code = <KEY_PLAYPAUSE>;
+            press-threshold-microvolt = <2000>;
+        };
+    };
+
+
+
+	sdio_pwrseq: sdio-pwrseq {
+        compatible = "mmc-pwrseq-simple";
+        pinctrl-names = "default";
+        pinctrl-0 = <&wifi_poweren_gpio>;
+
+        /*
+         * On the module itself this is one of these (depending
+         * on the actual card populated):
+         * - SDIO_RESET_L_WL_REG_ON
+         * - PDN (power down when low)
+         */
+        post-power-on-delay-ms = <200>;
+        reset-gpios = <&gpio1 RK_PC6 GPIO_ACTIVE_LOW>;
+        status = "okay";
+    };
+
+	vcc_1v8_s0: vcc-1v8-s0 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_1v8_s0";
+		regulator-boot-on;
+		regulator-always-on;
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		vin-supply = <&vcc_1v8_s3>;
+	};
+
+	vcc_3v3_s0: vcc-3v3-s0 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_3v3_s0";
+		regulator-boot-on;
+		regulator-always-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&vcc_3v3_s3>;
+	};
+
+
+
+
+
+
+
+	lcd_vci: lcd-vci {
+		compatible = "regulator-fixed";
+		regulator-name = "lcd_vci";
+		regulator-boot-on;
+		regulator-min-microvolt = <3000000>;
+		regulator-max-microvolt = <3000000>;
+		enable-active-high;
+		gpio = <&gpio4 RK_PC7 GPIO_ACTIVE_HIGH>;
+		vin-supply = <&vcc_sys>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&lcd_vci_en>;
+	};
+
+	vcc5v0_host: vcc5v0-host {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc5v0_host";
+		regulator-boot-on;
+		regulator-always-on;
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		enable-active-high;
+		gpio = <&gpio0 RK_PC7 GPIO_ACTIVE_HIGH>;
+		vin-supply = <&vcc5v0_device>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&usb_host_pwren>;
+	};
+
+	vbus5v0_typec: vbus5v0-typec {
+		compatible = "regulator-fixed";
+		regulator-name = "vbus5v0_typec";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		enable-active-high;
+		gpio = <&gpio0 RK_PC6 GPIO_ACTIVE_HIGH>;
+		vin-supply = <&vcc5v0_device>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&usb_otg0_pwren>;
+		status = "disabled";
+	};
+
+	vcc3v3_m2: vcc3v3-m2 {
+        compatible = "regulator-fixed";
+        regulator-name = "vcc3v3_m2";
+        gpios = <&gpio4 RK_PC6 GPIO_ACTIVE_HIGH>;
+        enable-active-high;
+        regulator-always-on;
+        regulator-boot-on;
+        regulator-min-microvolt = <3300000>;
+        regulator-max-microvolt = <3300000>;
+        startup-delay-us = <1000>;
+    };
+
+
+};
+
+
+
+&combphy1_psu {
+	status = "okay";
+};
+
+/**********禁用type-c dp输出节点**********/
+
+&dp {
+	status = "disabled";
+	svid = <0xff01>;
+};
+
+&dp0 {
+	status = "disabled";
+};
+
+&dp0_in_vp2 {
+	status = "disabled";
+};
+
+&dp0_sound {
+	status = "disabled";
+};
+
+&spdif_tx3 {
+	status = "disabled";
+};
+
+/**********已适配内容**********/
+
+/**********分支二禁用千兆网卡、调整为mcu uartx2交互**********/
+
+&uart1 {
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = <&uart1m2_xfer>;
+};
+
+&uart10 {
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = <&uart10m0_xfer>;
+};
+
+/**********禁用hdmi节点**********/
+
+&hdmi {
+	status = "disabled";
+	enable-gpios = <&gpio2 RK_PB0 GPIO_ACTIVE_HIGH>;
+	rockchip,sda-falling-delay-ns = <360>;
+};
+
+&hdmi_in_vp0 {
+	status = "disabled";
+};
+
+&hdptxphy_hdmi {
+	status = "disabled";
+};
+
+&route_hdmi {
+	status = "disabled";
+	connect = <&vp0_out_hdmi>;
+};
+
+&vp0 {
+	status = "disabled";
+};
+
+/**********PCIE-SSD**********/
+
+&combphy0_ps {
+	status = "okay";
+};
+
+&pcie0 {
+    vpcie3v3-supply = <&vcc3v3_m2>;
+    reset-gpios = <&gpio2 RK_PB0 GPIO_ACTIVE_HIGH>;
+    status = "okay";
+};
+
+/**********看门狗**********/
+
+&wdt{
+        status = "okay";
+};
+
+/**********ES8390 模拟MIC、扬声器**********/
+
+&i2c3 {
+    status = "okay";
+    /* ES8390 supports standard/fast I2C; keep the board bus at 100 kbit/s. */
+    clock-frequency = <100000>;
+    pinctrl-0 = <&i2c3m0_xfer>;
+    es8389: es8389@10 {
+        status = "okay";
+        #sound-dai-cells = <0>;
+        /* Linux supports ES8390 through the upstream ES8389 interface. */
+        compatible = "everest,es8389";
+        reg = <0x10>;
+        vddd-supply = <&vcc_1v8_s0>;
+        vdda-supply = <&vcc_3v3_s3>;
+        clocks = <&mclkout_sai1>;
+        clock-names = "mclk";
+        assigned-clocks = <&mclkout_sai1>;
+		assigned-clock-rates = <12288000>;
+		/*
+		 * U18 uses ES8390 LOUT2 and ROUT2 as a differential input pair.
+		 * The physical TL V4 board requires ROUT2 to be 180 degrees out of
+		 * phase with LOUT2; keep the vendor stereo channel routing intact.
+		 */
+		everest,invert-right-output;
+		/* 179 is -6 dB on the ES8390 0.5 dB/step DAC scale. */
+		everest,dac-playback-volume = <179>;
+        pinctrl-names = "default";
+        pinctrl-0 = <&sai1m0_mclk>;
+    };
+};
+
+&sai1 {
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = <&sai1m0_lrck
+             &sai1m0_sclk
+             &sai1m0_sdi0
+             &sai1m0_sdo0>;
+};
+
+/**********3.92寸屏幕**********/
+
+/*
+ * mipidcphy0 needs to be enabled
+ * when dsi is enabled
+ */
+&dsi {
+	/* Panel TE (FPC pin 39) is only routed to TP14, not to RK3576. */
+	disable-hold-mode;
+	status = "okay";
+};
+
+&dsi_panel {
+	reset-gpios = <&gpio3 RK_PA4 GPIO_ACTIVE_LOW>;
+	power-supply = <&lcd_vci>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&lcd_reset_l>;
+};
+
+&mipidcphy0 {
+	status = "okay";
+};
+
+/**********No TF connector on TL V4**********/
+
+&sdmmc {
+	status = "disabled";
+};
+
+/**********AIC8800D40 Wi-Fi/BT (vendor D80 software package)**********/
+
+&sdio {
+    max-frequency = <200000000>;
+    no-sd;
+    no-mmc;
+    bus-width = <4>;
+    disable-wp;
+    cap-sd-highspeed;
+    cap-sdio-irq;
+    keep-power-in-suspend;
+    mmc-pwrseq = <&sdio_pwrseq>;
+    non-removable;
+    pinctrl-names = "default";
+    pinctrl-0 = <&sdmmc1m0_bus4 &sdmmc1m0_clk &sdmmc1m0_cmd>;
+    sd-uhs-sdr104;
+    status = "okay";
+};
+
+/**********已适配内容**********/
+
+
+
+
+&pinctrl {
+	lcd {
+		/* GPIO4_C7 drives U26 SHDN; keep it low until the regulator enables VCI. */
+		lcd_vci_en: lcd-vci-en {
+			rockchip,pins = <4 RK_PC7 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+
+		/* Keep RSTB high before panel-simple generates its low reset pulse. */
+		lcd_reset_l: lcd-reset-l {
+			rockchip,pins = <3 RK_PA4 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+
+
+	headphone {
+		hp_det: hp-det {
+			rockchip,pins = <4 RK_PB0 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+
+	usb {
+		usb_host_pwren: usb-host-pwren {
+			rockchip,pins = <0 RK_PC7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		/* Referenced by the disabled legacy VBUS regulator node. */
+		usb_otg0_pwren: usb-otg0-pwren {
+			rockchip,pins = <0 RK_PC6 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	wireless-wlan {
+		wifi_poweren_gpio: wifi-poweren-gpio {
+			rockchip,pins = <1 RK_PC6 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+ * TL V4 pulls USB2_OTG0_VBUSDET up to 3.3 V through R88 and has no
+ * TCPC/usb-role-switch path.  The Type-C VBUS rail is a separate net, so
+ * neither the UTMI BVALID pin nor the Type-C GRF state can report attach.
+ */
+&u2phy0_otg {
+	rockchip,vbus-always-on;
+};
+
+&u2phy1_otg {
+	phy-supply = <&vcc5v0_host>;
+};
+
+&usbdp_phy {
+	status = "okay";
+};
+
+/*
+ * The TL V4 Type-C SuperSpeed pairs are routed to LT7911EXC for DP input,
+ * not to RK3576 USB3.  RK3576 only owns the USB2 D+/D- pair on this port.
+ */
+&usbdp_phy_u3 {
+	status = "disabled";
+};
+
+&usb_drd0_dwc3 {
+	phys = <&u2phy0_otg>;
+	phy-names = "usb2-phy";
+	dr_mode = "peripheral";
+	maximum-speed = "high-speed";
+	extcon = <&u2phy0>;
+	snps,dis_u2_susphy_quirk;
+	snps,usb2-lpm-disable;
+	status = "okay";
+};
+
+&usb_drd1_dwc3 {
+	dr_mode = "host";
+	status = "okay";
+};
+
+/**********KM8V7001JM-B810 UFS 2.1 storage**********/
+
+&ufs {
+	reset-gpios = <&gpio4 RK_PD0 GPIO_ACTIVE_HIGH>;
+	vcc-supply = <&vcc_3v3_s0>;
+	vccq2-supply = <&vcc_1v8_s0>;
+	status = "okay";
+};

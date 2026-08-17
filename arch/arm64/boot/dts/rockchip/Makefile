@@ -247,6 +247,7 @@ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576-evb1-v10-hdmi2dp.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576-evb1-v10-image-reverse-demo.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576-evb1-v10-ipc-4x-linux.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576-evb1-v10-linux.dtb
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576-violoop-tl-v4.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576-evb1-v10-linux-amp.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576-evb1-v10-lontium-hdmiin.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576-evb1-v10-nvp6324-ahd2csi.dtb
