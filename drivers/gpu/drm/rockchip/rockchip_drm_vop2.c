@@ -578,6 +578,9 @@ struct vop2_video_port {
 	uint8_t id;
 	bool layer_sel_update;
 	bool xmirror_en;
+#ifdef CONFIG_ROCKCHIP_VOP2_DT_MIRROR
+	bool ymirror_en;
+#endif
 	bool need_reset_p2i_flag;
 	atomic_t post_buf_empty_flag;
 	const struct vop2_video_port_regs *regs;
@@ -5650,8 +5653,15 @@ static int vop2_plane_atomic_check(struct drm_plane *plane, struct drm_atomic_st
 		}
 	}
 
+#ifdef CONFIG_ROCKCHIP_VOP2_DT_MIRROR
+	vpstate->xmirror_en = (pstate->rotation & DRM_MODE_REFLECT_X) ||
+			     vp->xmirror_en;
+	vpstate->ymirror_en = (pstate->rotation & DRM_MODE_REFLECT_Y) ||
+			     vp->ymirror_en;
+#else
 	vpstate->xmirror_en = (pstate->rotation & DRM_MODE_REFLECT_X) ? 1 : 0;
 	vpstate->ymirror_en = (pstate->rotation & DRM_MODE_REFLECT_Y) ? 1 : 0;
+#endif
 	vpstate->rotate_270_en = (pstate->rotation & DRM_MODE_ROTATE_270) ? 1 : 0;
 	vpstate->rotate_90_en = (pstate->rotation & DRM_MODE_ROTATE_90) ? 1 : 0;
 
@@ -14663,6 +14673,9 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 				vop2->vps[vp_id].primary_plane_phy_id = ROCKCHIP_VOP2_PHY_ID_INVALID;
 
 			vop2->vps[vp_id].xmirror_en = of_property_read_bool(child, "xmirror-enable");
+#ifdef CONFIG_ROCKCHIP_VOP2_DT_MIRROR
+			vop2->vps[vp_id].ymirror_en = of_property_read_bool(child, "ymirror-enable");
+#endif
 
 			ret = of_clk_set_defaults(child, false);
 			if (ret) {

@@ -63,6 +63,15 @@ config ROCKCHIP_VOP2
 	  This selects support for the VOP2 driver. The VOP2 hardware is
 	  first found on the RK3568.
 
+config ROCKCHIP_VOP2_DT_MIRROR
+	bool "Device-tree controlled VOP2 hardware mirroring"
+	depends on ROCKCHIP_VOP2
+	default n
+	help
+	  Enable opt-in X/Y hardware mirroring from VOP2 video-port device
+	  tree properties. Boards that do not select this option retain the
+	  original Rockchip plane-rotation behaviour.
+
 config ROCKCHIP_ANALOGIX_DP
 	bool "Rockchip specific extensions for Analogix DP driver"
 	select DRM_DISPLAY_HELPER
