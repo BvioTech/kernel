@@ -4,15 +4,15 @@
  * Display controller: Chip Wealth CH13726A (factory programmed)
  * Touch controller: FocalTech FT3519 (described in the TL V4 base DTSI)
  *
- * Keep the complete panel description in this TL V4-only DTSI.  The
- * Rockchip DSI2 loader-logo path is hard-wired to panel-simple, so using the
- * generic DSI panel implementation here is required for a safe handoff from
- * U-Boot without changing shared Rockchip display code.
+ * The controller's OTP contains the vendor register configuration, so this
+ * panel must not receive a full vendor initialization table.  It still needs
+ * the supplier's short DCS wake sequence after reset: TE on, sleep out, then
+ * display on with the specified delays.
  */
 
 &dsi {
 	dsi_panel: panel@0 {
-		compatible = "fpt,ttcm03921235", "simple-panel-dsi";
+		compatible = "simple-panel-dsi";
 		reg = <0>;
 		status = "okay";
 
@@ -35,11 +35,12 @@
 		rockchip,dcs-backlight-max = <255>;
 		rockchip,dcs-display-control;
 
+		/* Supplier short code: 35 00; 11 + 120 ms; 29 + 40 ms. */
 		panel-init-sequence = [
+			15 00 02 35 00
 			05 78 01 11
 			05 28 01 29
 		];
-
 		panel-exit-sequence = [
 			05 00 01 28
 			05 78 01 10
@@ -49,6 +50,12 @@
 			native-mode = <&ttcm03921235_timing>;
 
 			ttcm03921235_timing: timing0 {
+				/*
+				 * U-Boot gets X mirror from vp1/xmirror-enable; supply the
+				 * Y half here so its logo and Linux hand-off stay aligned.
+				 * Linux ignores this U-Boot timing flag and mirrors VP1 X/Y.
+				 */
+				screen-rotate = <0x20000000>;
 				clock-frequency = <84296640>;
 				hactive = <1080>;
 				hfront-porch = <12>;

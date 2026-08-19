@@ -302,7 +302,9 @@
 		focaltech,reset-gpio = <&gpio4 RK_PA0 GPIO_ACTIVE_LOW>;
 		focaltech,irq-gpio = <&gpio4 RK_PA1 GPIO_ACTIVE_HIGH>;
 		focaltech,display-coords = <0 0 1079 1239>;
-		/* Native touch orientation; the direct-DRM UI applies its own transform. */
+		/* The fitted panel/touch assembly is physically mounted upside down. */
+		touchscreen-inverted-x;
+		touchscreen-inverted-y;
 		focaltech,max-touch-number = <10>;
 		vdd-supply = <&vcc_3v3_s0>;
 		vcc_i2c-supply = <&vcc_1v8_s0>;
@@ -325,8 +327,8 @@
 
 		max-touch-number = <10>;
 		pos-swap = <0>;
-		posx-reverse = <0>;
-		posy-reverse = <0>;
+		posx-reverse = <1>;
+		posy-reverse = <1>;
 		display-coords = <0 0 1079 1239>;
 		panel = <&dsi_panel>;
 		wakeup-source;
@@ -488,7 +490,12 @@
 };
 
 &vp1 {
-	/* Keep VOP scan native; panel DCS scan rotation remains disabled. */
+	/*
+	 * Hardware 180-degree scanout: mirror both axes in VOP2.  This avoids
+	 * a software copy and does not alter either panel's DCS command stream.
+	 */
+	xmirror-enable;
+	ymirror-enable;
 };
 
 &sai6 {
