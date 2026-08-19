@@ -27,6 +27,7 @@
 #include <linux/i2c.h>
 #include <linux/media-bus-format.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
@@ -193,6 +194,9 @@ struct panel_simple {
 	struct drm_panel base;
 	struct mipi_dsi_device *dsi;
 	bool enabled;
+	bool dcs_display_control;
+	bool dcs_display_on;
+	struct mutex dcs_lock;
 
 	bool prepared;
 	/**
@@ -532,6 +536,9 @@ int panel_simple_loader_protect(struct drm_panel *panel)
 
 	p->prepared = true;
 	p->enabled = true;
+	mutex_lock(&p->dcs_lock);
+	p->dcs_display_on = true;
+	mutex_unlock(&p->dcs_lock);
 
 	return 0;
 }
@@ -588,6 +595,9 @@ static int panel_simple_unprepare(struct drm_panel *panel)
 		panel_simple_msleep(p->desc->delay.unprepare);
 
 	p->prepared = false;
+	mutex_lock(&p->dcs_lock);
+	p->dcs_display_on = false;
+	mutex_unlock(&p->dcs_lock);
 
 	return 0;
 }
@@ -635,6 +645,9 @@ static int panel_simple_prepare(struct drm_panel *panel)
 	}
 
 	p->prepared = true;
+	mutex_lock(&p->dcs_lock);
+	p->dcs_display_on = true;
+	mutex_unlock(&p->dcs_lock);
 
 	return 0;
 }
@@ -837,6 +850,72 @@ static int dcs_bl_update_status(struct backlight_device *bl)
 	return 0;
 }
 
+static int panel_simple_set_display_power(struct panel_simple *p, bool on)
+{
+	unsigned long mode_flags;
+	int ret;
+
+	mode_flags = p->dsi->mode_flags;
+	p->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+	ret = on ? mipi_dsi_dcs_set_display_on(p->dsi) :
+		mipi_dsi_dcs_set_display_off(p->dsi);
+	p->dsi->mode_flags = mode_flags;
+
+	return ret < 0 ? ret : 0;
+}
+
+static ssize_t display_power_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct panel_simple *p = dev_get_drvdata(dev);
+	bool display_on;
+
+	mutex_lock(&p->dcs_lock);
+	display_on = p->prepared && p->dcs_display_on;
+	mutex_unlock(&p->dcs_lock);
+
+	return sysfs_emit(buf, "%u\n", display_on);
+}
+
+static ssize_t display_power_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct panel_simple *p = dev_get_drvdata(dev);
+	bool display_on;
+	int ret;
+
+	ret = kstrtobool(buf, &display_on);
+	if (ret)
+		return ret;
+
+	mutex_lock(&p->dcs_lock);
+	if (!p->prepared || !p->dsi) {
+		ret = -EHOSTDOWN;
+	} else if (display_on == p->dcs_display_on) {
+		ret = 0;
+	} else {
+		ret = panel_simple_set_display_power(p, display_on);
+		if (!ret) {
+			panel_simple_msleep(20);
+			p->dcs_display_on = display_on;
+		}
+	}
+	mutex_unlock(&p->dcs_lock);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(display_power);
+
+static struct attribute *panel_simple_dcs_attrs[] = {
+	&dev_attr_display_power.attr,
+	NULL,
+};
+
+static const struct attribute_group panel_simple_dcs_attr_group = {
+	.attrs = panel_simple_dcs_attrs,
+};
+
 static int dcs_bl_get_brightness(struct backlight_device *bl)
 {
 	struct panel_simple *p = bl_get_data(bl);
@@ -877,6 +956,7 @@ static int panel_simple_probe(struct device *dev, const struct panel_desc *desc)
 		return -ENOMEM;
 
 	panel->enabled = false;
+	mutex_init(&panel->dcs_lock);
 	panel->prepared_time = 0;
 	panel->desc = desc;
 
@@ -5107,6 +5187,9 @@ static int panel_simple_dsi_probe(struct mipi_dsi_device *dsi)
 
 	panel = dev_get_drvdata(dev);
 	panel->dsi = dsi;
+	panel->dcs_display_control =
+		of_property_read_bool(dev->of_node,
+				      "rockchip,dcs-display-control");
 
 	if (!panel->base.backlight) {
 		struct backlight_properties props;
@@ -5123,6 +5206,15 @@ static int panel_simple_dsi_probe(struct mipi_dsi_device *dsi)
 		if (IS_ERR(panel->base.backlight)) {
 			err = PTR_ERR(panel->base.backlight);
 			dev_err(dev, "failed to register dcs backlight: %d\n",
+				err);
+			return err;
+		}
+	}
+
+	if (panel->dcs_display_control) {
+		err = devm_device_add_group(dev, &panel_simple_dcs_attr_group);
+		if (err) {
+			dev_err(dev, "failed to register DCS display control: %d\n",
 				err);
 			return err;
 		}
