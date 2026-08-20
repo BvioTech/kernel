@@ -6,14 +6,14 @@
  *
  * Author: Jianwei Fan <jianwei.fan@rock-chips.com>
  *
- * Runtime-only LT7911EXC variant based on Rockchip's LT7911UXC V4L2 bridge.
- * It uses the LT7911EXC chip ID and documented runtime registers and
- * deliberately contains no bridge-flash erase/update path.
+ * LT7911EXC variant based on Rockchip's LT7911UXC V4L2 bridge. The firmware
+ * update node follows Lontium's LT2408 Linux I2C Driver v2.0 CRC flow.
  *
  */
 
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
 #include <linux/hdmi.h>
 #include <linux/i2c.h>
@@ -36,7 +36,7 @@
 #include <media/v4l2-event.h>
 #include <media/v4l2-fwnode.h>
 
-#define DRIVER_VERSION			KERNEL_VERSION(0, 0x01, 0x01)
+#define DRIVER_VERSION			KERNEL_VERSION(0, 0x01, 0x02)
 
 static int debug;
 module_param(debug, int, 0644);
@@ -44,6 +44,12 @@ MODULE_PARM_DESC(debug, "debug level (0-3)");
 
 #define I2C_MAX_XFER_SIZE	128
 #define POLL_INTERVAL_MS	1000
+
+#define LT7911EXC_FW_SIZE		(64 * 1024)
+#define LT7911EXC_FW_CRC_ADDR		(LT7911EXC_FW_SIZE - 4)
+#define LT7911EXC_FW_PAGE_SIZE		32
+#define LT7911EXC_FW_FILE \
+	"violoop/lt7911exc/LT7911EXC_U2Q02CEM_FCS01x870BF9(CSx600856_CRCx74101F2A).bin"
 
 #define LT7911EXC_LINK_FREQ_1250M	1250000000
 #define LT7911EXC_LINK_FREQ_860M	860000000
@@ -137,6 +143,7 @@ struct lt7911exc {
 	struct v4l2_ctrl_handler hdl;
 	struct i2c_client *i2c_client;
 	struct mutex confctl_mutex;
+	struct mutex fw_lock;
 	struct v4l2_ctrl *detect_tx_5v_ctrl;
 	struct v4l2_ctrl *audio_sampling_rate_ctrl;
 	struct v4l2_ctrl *audio_present_ctrl;
@@ -163,6 +170,8 @@ struct lt7911exc {
 	bool is_audio_present;
 	bool power_on;
 	bool initialized;
+	bool runtime_registered;
+	bool fw_update_active;
 	int plugin_irq;
 	u32 irq_count;
 	u32 mipi_freq_idx;
@@ -370,6 +379,11 @@ static void i2c_rd(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 	u8 reg_addr = reg & 0xFF;
 	struct i2c_msg msgs[3];
 
+	if (READ_ONCE(lt7911exc->fw_update_active)) {
+		memset(values, 0, n);
+		return;
+	}
+
 	msgs[0].addr = client->addr;
 	msgs[0].flags = 0;
 	msgs[0].len = 2;
@@ -421,6 +435,9 @@ static void i2c_wr(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 	struct i2c_msg msgs[2];
 	u8 data[I2C_MAX_XFER_SIZE];
 	u8 buf[2] = { 0xFF, reg >> 8};
+
+	if (READ_ONCE(lt7911exc->fw_update_active))
+		return;
 
 	if ((1 + n) > I2C_MAX_XFER_SIZE) {
 		n = I2C_MAX_XFER_SIZE - 1;
@@ -493,6 +510,500 @@ static void lt7911exc_i2c_disable(struct v4l2_subdev *sd)
 {
 	i2c_wr8(sd, I2C_EN_REG, I2C_DISABLE);
 }
+
+/*
+ * LT7911EXC firmware is written directly through its normal I2C address.
+ * This is deliberately an explicit, root-only maintenance operation: probe
+ * never erases or rewrites flash.  The vendor image contains the LT7911EXC
+ * MCU program; it is not a host-side updater executable.
+ */
+static int lt7911exc_fw_write(struct lt7911exc *lt7911exc, u8 reg,
+			      const u8 *values, size_t count)
+{
+	struct i2c_client *client = lt7911exc->i2c_client;
+	u8 buffer[LT7911EXC_FW_PAGE_SIZE + 1];
+	struct i2c_msg message = {
+		.addr = client->addr,
+		.flags = 0,
+		.buf = buffer,
+	};
+	int ret;
+
+	if (count > LT7911EXC_FW_PAGE_SIZE)
+		return -EINVAL;
+
+	buffer[0] = reg;
+	memcpy(buffer + 1, values, count);
+	message.len = count + 1;
+	ret = i2c_transfer(client->adapter, &message, 1);
+	if (ret < 0)
+		return ret;
+	if (ret != 1)
+		return -EIO;
+
+	return 0;
+}
+
+static int lt7911exc_fw_write8(struct lt7911exc *lt7911exc, u8 reg, u8 value)
+{
+	return lt7911exc_fw_write(lt7911exc, reg, &value, 1);
+}
+
+static int lt7911exc_fw_read(struct lt7911exc *lt7911exc, u8 reg,
+			     u8 *values, size_t count)
+{
+	struct i2c_client *client = lt7911exc->i2c_client;
+	struct i2c_msg messages[2] = {
+		{
+			.addr = client->addr,
+			.flags = 0,
+			.len = 1,
+			.buf = &reg,
+		}, {
+			.addr = client->addr,
+			.flags = I2C_M_RD,
+			.len = count,
+			.buf = values,
+		},
+	};
+	int ret;
+
+	ret = i2c_transfer(client->adapter, messages, ARRAY_SIZE(messages));
+	if (ret < 0)
+		return ret;
+	if (ret != ARRAY_SIZE(messages))
+		return -EIO;
+
+	return 0;
+}
+
+static int lt7911exc_fw_select_flash(struct lt7911exc *lt7911exc)
+{
+	int ret;
+
+	ret = lt7911exc_fw_write8(lt7911exc, 0xff, 0xe0);
+	if (ret)
+		return ret;
+
+	return lt7911exc_fw_write8(lt7911exc, 0xee, 0x01);
+}
+
+static void lt7911exc_fw_release_flash(struct lt7911exc *lt7911exc)
+{
+	if (!lt7911exc_fw_write8(lt7911exc, 0xff, 0xe0))
+		lt7911exc_fw_write8(lt7911exc, 0xee, 0x00);
+}
+
+static u32 lt7911exc_fw_crc32(const u8 *data, size_t length)
+{
+	u32 crc = 0xffffffff;
+	size_t offset;
+	int bit;
+
+	for (offset = 0; offset < length; offset += 4) {
+		u32 word = (u32)data[offset] |
+			   ((u32)data[offset + 1] << 8) |
+			   ((u32)data[offset + 2] << 16) |
+			   ((u32)data[offset + 3] << 24);
+
+		crc ^= word;
+		for (bit = 0; bit < 32; bit++)
+			crc = (crc & BIT(31)) ?
+				(crc << 1) ^ 0x04c11db7 : crc << 1;
+	}
+
+	return crc;
+}
+
+static int lt7911exc_fw_load(struct lt7911exc *lt7911exc,
+			     const struct firmware **firmware, u32 *crc)
+{
+	struct device *dev = &lt7911exc->i2c_client->dev;
+	u8 *image;
+	int ret;
+
+	ret = request_firmware(firmware, LT7911EXC_FW_FILE, dev);
+	if (ret)
+		return ret;
+	if (!(*firmware)->size || (*firmware)->size > LT7911EXC_FW_CRC_ADDR) {
+		ret = -EFBIG;
+		goto release;
+	}
+
+	image = kvmalloc(LT7911EXC_FW_SIZE, GFP_KERNEL);
+	if (!image) {
+		ret = -ENOMEM;
+		goto release;
+	}
+
+	memset(image, 0xff, LT7911EXC_FW_SIZE);
+	memcpy(image, (*firmware)->data, (*firmware)->size);
+	*crc = lt7911exc_fw_crc32(image, LT7911EXC_FW_CRC_ADDR);
+	kvfree(image);
+	return 0;
+
+release:
+	release_firmware(*firmware);
+	*firmware = NULL;
+	return ret;
+}
+
+static int lt7911exc_fw_reset_fifo(struct lt7911exc *lt7911exc)
+{
+	int ret;
+
+	ret = lt7911exc_fw_select_flash(lt7911exc);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5f, 0x08);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5f, 0x00);
+	if (!ret)
+		msleep(100);
+	return ret;
+}
+
+static int lt7911exc_fw_read_hw_crc(struct lt7911exc *lt7911exc, u32 *crc)
+{
+	u8 value[4];
+	int ret;
+
+	ret = lt7911exc_fw_select_flash(lt7911exc);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x7b, 0x60);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x7b, 0x40);
+	if (ret)
+		return ret;
+	msleep(150);
+	ret = lt7911exc_fw_read(lt7911exc, 0x22, value, sizeof(value));
+	if (ret)
+		return ret;
+
+	*crc = ((u32)value[0] << 24) | ((u32)value[1] << 16) |
+	       ((u32)value[2] << 8) | value[3];
+	return 0;
+}
+
+static int lt7911exc_fw_read_flash_crc(struct lt7911exc *lt7911exc, u32 *crc)
+{
+	u8 value[4];
+	int ret;
+
+	ret = lt7911exc_fw_reset_fifo(lt7911exc);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x54, 0x45);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x55, 0x03);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x56, 0x04);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x57, 0x00);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x58, 0x00);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5a, 0x00);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5b, 0xff);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5c, 0xfc);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x51, 0x01);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x51, 0x00);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_read(lt7911exc, 0x5e, value, sizeof(value));
+	if (ret)
+		return ret;
+
+	*crc = ((u32)value[3] << 24) | ((u32)value[2] << 16) |
+	       ((u32)value[1] << 8) | value[0];
+	return 0;
+}
+
+static int lt7911exc_fw_erase(struct lt7911exc *lt7911exc)
+{
+	static const struct {
+		u8 reg;
+		u8 value;
+	} sequence[] = {
+		{ 0x54, 0x01 }, { 0x55, 0x06 }, { 0x51, 0x01 },
+		{ 0x51, 0x00 }, { 0x54, 0x05 }, { 0x55, 0xd8 },
+		{ 0x5a, 0x00 }, { 0x5b, 0x00 }, { 0x5c, 0x00 },
+		{ 0x51, 0x01 }, { 0x51, 0x00 },
+	};
+	unsigned int index;
+	int ret;
+
+	ret = lt7911exc_fw_select_flash(lt7911exc);
+	if (ret)
+		return ret;
+	for (index = 0; index < ARRAY_SIZE(sequence); index++) {
+		ret = lt7911exc_fw_write8(lt7911exc, sequence[index].reg,
+					  sequence[index].value);
+		if (ret)
+			return ret;
+	}
+	msleep(200);
+	return 0;
+}
+
+static int lt7911exc_fw_set_address(struct lt7911exc *lt7911exc, u32 address)
+{
+	int ret;
+
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5a, address >> 16);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5b, address >> 8);
+	if (ret)
+		return ret;
+	return lt7911exc_fw_write8(lt7911exc, 0x5c, address);
+}
+
+static int lt7911exc_fw_flush_partial(struct lt7911exc *lt7911exc,
+				      u32 address)
+{
+	int ret;
+
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5f, 0x00);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5f, 0x01);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_set_address(lt7911exc, address);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5f, 0x05);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5f, 0x01);
+	if (ret)
+		return ret;
+	usleep_range(1000, 1500);
+	return lt7911exc_fw_write8(lt7911exc, 0x5f, 0x00);
+}
+
+static int lt7911exc_fw_program_data(struct lt7911exc *lt7911exc,
+				     u32 address, const u8 *data,
+				     size_t length)
+{
+	size_t offset = 0;
+	int ret;
+
+	ret = lt7911exc_fw_select_flash(lt7911exc);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5f, 0x01);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_set_address(lt7911exc, address);
+	if (ret)
+		return ret;
+
+	while (offset < length) {
+		size_t count = min_t(size_t, LT7911EXC_FW_PAGE_SIZE,
+					 length - offset);
+
+		ret = lt7911exc_fw_write(lt7911exc, 0x5d,
+					 data + offset, count);
+		if (ret)
+			return ret;
+		if (count < LT7911EXC_FW_PAGE_SIZE) {
+			ret = lt7911exc_fw_flush_partial(lt7911exc,
+							 address + offset);
+			if (ret)
+				return ret;
+		}
+		offset += count;
+	}
+
+	return lt7911exc_fw_write8(lt7911exc, 0x5f, 0x00);
+}
+
+static int lt7911exc_fw_write_crc(struct lt7911exc *lt7911exc, u32 crc)
+{
+	u8 value[4] = { crc, crc >> 8, crc >> 16, crc >> 24 };
+	int ret;
+
+	ret = lt7911exc_fw_select_flash(lt7911exc);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write8(lt7911exc, 0x5f, 0x01);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_set_address(lt7911exc, LT7911EXC_FW_CRC_ADDR);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_write(lt7911exc, 0x5d, value, sizeof(value));
+	if (ret)
+		return ret;
+	return lt7911exc_fw_flush_partial(lt7911exc,
+					    LT7911EXC_FW_CRC_ADDR);
+}
+
+static void lt7911exc_fw_pause_runtime(struct lt7911exc *lt7911exc)
+{
+	if (!lt7911exc->runtime_registered)
+		return;
+
+	if (lt7911exc->i2c_client->irq)
+		disable_irq(lt7911exc->i2c_client->irq);
+	else {
+		del_timer_sync(&lt7911exc->timer);
+		cancel_work_sync(&lt7911exc->work_i2c_poll);
+	}
+	cancel_delayed_work_sync(&lt7911exc->delayed_work_hotplug);
+	cancel_delayed_work_sync(&lt7911exc->delayed_work_res_change);
+}
+
+static void lt7911exc_fw_resume_runtime(struct lt7911exc *lt7911exc)
+{
+	if (!lt7911exc->runtime_registered)
+		return;
+
+	if (lt7911exc->i2c_client->irq)
+		enable_irq(lt7911exc->i2c_client->irq);
+	else
+		mod_timer(&lt7911exc->timer,
+			  jiffies + msecs_to_jiffies(POLL_INTERVAL_MS));
+	schedule_delayed_work(&lt7911exc->delayed_work_res_change,
+			      msecs_to_jiffies(POLL_INTERVAL_MS));
+}
+
+static int lt7911exc_fw_begin(struct lt7911exc *lt7911exc)
+{
+	mutex_lock(&lt7911exc->fw_lock);
+	if (lt7911exc->fw_update_active) {
+		mutex_unlock(&lt7911exc->fw_lock);
+		return -EBUSY;
+	}
+	WRITE_ONCE(lt7911exc->fw_update_active, true);
+	lt7911exc_fw_pause_runtime(lt7911exc);
+	usleep_range(20000, 25000);
+	return 0;
+}
+
+static void lt7911exc_fw_end(struct lt7911exc *lt7911exc)
+{
+	lt7911exc_fw_release_flash(lt7911exc);
+	WRITE_ONCE(lt7911exc->fw_update_active, false);
+	lt7911exc_fw_resume_runtime(lt7911exc);
+	mutex_unlock(&lt7911exc->fw_lock);
+}
+
+static int lt7911exc_fw_update(struct lt7911exc *lt7911exc, bool force)
+{
+	const struct firmware *firmware = NULL;
+	u32 expected_crc, flash_crc, hardware_crc;
+	int ret;
+
+	ret = lt7911exc_fw_load(lt7911exc, &firmware, &expected_crc);
+	if (ret)
+		return ret;
+
+	ret = lt7911exc_fw_read_hw_crc(lt7911exc, &hardware_crc);
+	if (!ret && !force) {
+		if (hardware_crc == expected_crc) {
+			dev_info(&lt7911exc->i2c_client->dev,
+				 "firmware CRC matches 0x%08x; no upgrade needed\n",
+				 expected_crc);
+			goto out;
+		}
+	}
+
+	if (force)
+		dev_info(&lt7911exc->i2c_client->dev,
+			 "forced firmware update; programming %s (%zu bytes, crc 0x%08x)\n",
+			 LT7911EXC_FW_FILE, firmware->size, expected_crc);
+	else
+		dev_info(&lt7911exc->i2c_client->dev,
+			 "firmware CRC mismatch; programming %s (%zu bytes, crc 0x%08x)\n",
+			 LT7911EXC_FW_FILE, firmware->size, expected_crc);
+	ret = lt7911exc_fw_erase(lt7911exc);
+	if (ret)
+		goto out;
+	ret = lt7911exc_fw_program_data(lt7911exc, 0, firmware->data,
+					 firmware->size);
+	if (ret)
+		goto out;
+	ret = lt7911exc_fw_write_crc(lt7911exc, expected_crc);
+	if (ret)
+		goto out;
+	ret = lt7911exc_fw_read_flash_crc(lt7911exc, &flash_crc);
+	if (ret)
+		goto out;
+	ret = lt7911exc_fw_read_hw_crc(lt7911exc, &hardware_crc);
+	if (ret)
+		goto out;
+	if (flash_crc != expected_crc || hardware_crc != expected_crc) {
+		dev_err(&lt7911exc->i2c_client->dev,
+			"firmware verify failed: file=0x%08x flash=0x%08x hardware=0x%08x\n",
+			expected_crc, flash_crc, hardware_crc);
+		ret = -EIO;
+		goto out;
+	}
+	dev_info(&lt7911exc->i2c_client->dev,
+		 "LT7911EXC firmware programmed and verified\n");
+
+out:
+	release_firmware(firmware);
+	return ret;
+}
+
+static ssize_t firmware_update_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct lt7911exc *lt7911exc = to_lt7911exc(sd);
+	bool force;
+	int ret;
+
+	if (sysfs_streq(buf, "update"))
+		force = false;
+	else if (sysfs_streq(buf, "force"))
+		force = true;
+	else
+		return -EINVAL;
+
+	ret = lt7911exc_fw_begin(lt7911exc);
+	if (ret)
+		return ret;
+	ret = lt7911exc_fw_update(lt7911exc, force);
+	lt7911exc_fw_end(lt7911exc);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static DEVICE_ATTR_WO(firmware_update);
+
+static struct attribute *lt7911exc_fw_attrs[] = {
+	&dev_attr_firmware_update.attr,
+	NULL,
+};
+
+static const struct attribute_group lt7911exc_fw_attr_group = {
+	.attrs = lt7911exc_fw_attrs,
+};
 
 static inline bool tx_5v_power_present(struct v4l2_subdev *sd)
 {
@@ -1815,6 +2326,8 @@ static int lt7911exc_probe(struct i2c_client *client,
 	sd = &lt7911exc->sd;
 	lt7911exc->i2c_client = client;
 	lt7911exc->mbus_fmt_code = LT7911EXC_MEDIA_BUS_FMT;
+	i2c_set_clientdata(client, sd);
+	mutex_init(&lt7911exc->fw_lock);
 
 	err = lt7911exc_probe_of(lt7911exc);
 	if (err) {
@@ -1827,9 +2340,18 @@ static int lt7911exc_probe(struct i2c_client *client,
 	lt7911exc->nosignal = true;
 
 	__lt7911exc_power_on(lt7911exc);
-	err = lt7911exc_check_chip_id(lt7911exc);
-	if (err < 0)
+	err = devm_device_add_group(dev, &lt7911exc_fw_attr_group);
+	if (err) {
+		dev_err(dev, "failed to create firmware maintenance interface: %d\n",
+			err);
 		return err;
+	}
+	err = lt7911exc_check_chip_id(lt7911exc);
+	if (err < 0) {
+		dev_warn(dev,
+			 "runtime firmware not detected; I2C firmware updater remains available\n");
+		return 0;
+	}
 
 	INIT_DELAYED_WORK(&lt7911exc->delayed_work_hotplug,
 			lt7911exc_delayed_work_hotplug);
@@ -1918,6 +2440,7 @@ static int lt7911exc_probe(struct i2c_client *client,
 		goto err_clean_entity;
 	}
 
+	WRITE_ONCE(lt7911exc->runtime_registered, true);
 	WRITE_ONCE(lt7911exc->initialized, true);
 	schedule_delayed_work(&lt7911exc->delayed_work_res_change,
 			      msecs_to_jiffies(POLL_INTERVAL_MS));
@@ -1949,7 +2472,15 @@ static void lt7911exc_remove(struct i2c_client *client)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct lt7911exc *lt7911exc = to_lt7911exc(sd);
 
+	if (!lt7911exc->runtime_registered) {
+		if (lt7911exc->xvclk)
+			clk_disable_unprepare(lt7911exc->xvclk);
+		mutex_destroy(&lt7911exc->fw_lock);
+		return;
+	}
+
 	WRITE_ONCE(lt7911exc->initialized, false);
+	WRITE_ONCE(lt7911exc->runtime_registered, false);
 	if (!lt7911exc->i2c_client->irq) {
 		del_timer_sync(&lt7911exc->timer);
 		flush_work(&lt7911exc->work_i2c_poll);
@@ -1963,6 +2494,7 @@ static void lt7911exc_remove(struct i2c_client *client)
 #endif
 	v4l2_ctrl_handler_free(&lt7911exc->hdl);
 	mutex_destroy(&lt7911exc->confctl_mutex);
+	mutex_destroy(&lt7911exc->fw_lock);
 	if (lt7911exc->xvclk)
 		clk_disable_unprepare(lt7911exc->xvclk);
 }
@@ -2001,3 +2533,4 @@ module_exit(lt7911exc_driver_exit);
 MODULE_DESCRIPTION("Lontium lt7911exc DP/type-c to CSI-2 bridge driver");
 MODULE_AUTHOR("Jianwei Fan <jianwei.fan@rock-chips.com>");
 MODULE_LICENSE("GPL");
+MODULE_FIRMWARE(LT7911EXC_FW_FILE);
