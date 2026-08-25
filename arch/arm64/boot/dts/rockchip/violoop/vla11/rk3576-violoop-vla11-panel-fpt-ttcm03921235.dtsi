@@ -2,7 +2,7 @@
 /*
  * FPT TTCM03921235 AMOLED module
  * Display controller: Chip Wealth CH13726A (factory programmed)
- * Touch controller: FocalTech FT3519 (described in the TL V4 base DTSI)
+ * Touch controller: FocalTech FT3519 (described in the VLA11 base DTSI)
  *
  * The controller's OTP contains the vendor register configuration, so this
  * panel must not receive a full vendor initialization table.  It still needs

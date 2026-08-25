@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Violoop VLA11 hardware with the Rockchip minimal Debian userspace scheme.
+ */
+
+/dts-v1/;
+
+#include "rk3576.dtsi"
+#include "rk3576-linux.dtsi"
+#include "violoop/vla11/rk3576-violoop-vla11-base.dtsi"
+#include "violoop/vla11/rk3576-violoop-vla11-panel-fpt-ttcm03921235.dtsi"
+#include "violoop/vla11/rk3576-violoop-vla11-board.dtsi"
+#include "violoop/vla11/rk3576-violoop-vla11-rk1828.dtsi"
+#include "violoop/vla11/rk3576-violoop-vla11-peripherals.dtsi"
+
+/ {
+	model = "Violoop RK3576 VLA11 Minimal Debian";
+	compatible = "violoop,rk3576-vla11", "rockchip,rk3576";
+};

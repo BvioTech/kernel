@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: (GPL-2.0+ OR MIT)
 /*
  * Copyright (c) 2024 Rockchip Electronics Co., Ltd.
- * Violoop TL V4 board profile.
+ * Violoop VLA11 board profile.
  *
  */
 
@@ -516,7 +516,7 @@
 	mmc-hs400-1_8v;
 	mmc-hs400-enhanced-strobe;
 	full-pwr-cycle-in-suspend;
-	/* TL V4 uses the UFS device inside KM8V7001JM-B810. */
+	/* VLA11 uses the UFS device inside KM8V7001JM-B810. */
 	status = "disabled";
 };
 

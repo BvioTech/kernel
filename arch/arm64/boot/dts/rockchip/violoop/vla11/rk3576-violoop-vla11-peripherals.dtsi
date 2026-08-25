@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: (GPL-2.0+ OR MIT)
 /*
- * Violoop TL V4 product peripherals.
+ * Violoop VLA11 product peripherals.
  *
- * Optional devices populated on the complete TL V4 product.
+ * Optional devices populated on the complete VLA11 product.
  */
 
 / {
@@ -45,7 +45,7 @@
     pinctrl-names = "default";
     /*
      * The 3-wire WS2812 strip only uses MOSI.  Do not request CS0 here:
-     * SPI4_M3_CSN0 is GPIO2_B2, shared with PCIe0 CLKREQ# on TL V4.
+     * SPI4_M3_CSN0 is GPIO2_B2, shared with PCIe0 CLKREQ# on VLA11.
      * Userspace sets SPI_NO_CS for transfers.
      */
     pinctrl-0 = <&spi4m3_pins>;
@@ -92,14 +92,14 @@
         pinctrl-names = "default";
         pinctrl-0 = <&rk628_pin>;
         interrupt-parent = <&gpio2>;
-		/* VAL11 TL V4: D2=RESET, D3=INT, D4=PWR_EN, D5=Plugin_DET. */
+		/* VAL11 VLA11: D2=RESET, D3=INT, D4=PWR_EN, D5=Plugin_DET. */
 		interrupts = <RK_PD3 IRQ_TYPE_LEVEL_HIGH>;
 		enable-gpios = <&gpio2 RK_PD4 GPIO_ACTIVE_HIGH>;
 		reset-gpios = <&gpio2 RK_PD2 GPIO_ACTIVE_LOW>;
 		plugin-det-gpios = <&gpio2 RK_PD5 GPIO_ACTIVE_LOW>;
         continues-clk = <1>;
         /*
-         * TL V4 validation: leave CEC disabled while the RK628H reports an
+         * VLA11 validation: leave CEC disabled while the RK628H reports an
          * I2C failure at HDMI_RX_CEC_RX_CNT (0x31f20).  CEC is independent
          * of the HDMI-to-CSI video path and a stuck CEC interrupt must not
          * hold the shared level-high INT line asserted.
@@ -233,7 +233,7 @@
 /**********Type-C/DP input through LT7911EXC to CSI3**********/
 
 /*
- * TL V4 connects I2C8 M2, GPIO0_B4 LT_RST, GPIO0_B5 INT_GPIO11 and four
+ * VLA11 connects I2C8 M2, GPIO0_B4 LT_RST, GPIO0_B5 INT_GPIO11 and four
  * CSI3 data lanes to the bridge.
  */
 &i2c8 {

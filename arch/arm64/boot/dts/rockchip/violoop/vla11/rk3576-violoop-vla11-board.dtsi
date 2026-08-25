@@ -250,7 +250,7 @@
 		assigned-clock-rates = <12288000>;
 		/*
 		 * U18 uses ES8390 LOUT2 and ROUT2 as a differential input pair.
-		 * The physical TL V4 board requires ROUT2 to be 180 degrees out of
+		 * The physical VLA11 board requires ROUT2 to be 180 degrees out of
 		 * phase with LOUT2; keep the vendor stereo channel routing intact.
 		 */
 		everest,invert-right-output;
@@ -293,7 +293,7 @@
 	status = "okay";
 };
 
-/**********No TF connector on TL V4**********/
+/**********No TF connector on VLA11**********/
 
 &sdmmc {
 	status = "disabled";
@@ -374,7 +374,7 @@
 
 
 /*
- * TL V4 pulls USB2_OTG0_VBUSDET up to 3.3 V through R88 and has no
+ * VLA11 pulls USB2_OTG0_VBUSDET up to 3.3 V through R88 and has no
  * TCPC/usb-role-switch path.  The Type-C VBUS rail is a separate net, so
  * neither the UTMI BVALID pin nor the Type-C GRF state can report attach.
  */
@@ -391,7 +391,7 @@
 };
 
 /*
- * The TL V4 Type-C SuperSpeed pairs are routed to LT7911EXC for DP input,
+ * The VLA11 Type-C SuperSpeed pairs are routed to LT7911EXC for DP input,
  * not to RK3576 USB3.  RK3576 only owns the USB2 D+/D- pair on this port.
  */
 &usbdp_phy_u3 {
