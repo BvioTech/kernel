@@ -8,11 +8,22 @@
 struct dma_trx_obj;
 struct device;
 
+/*
+ * Violoop: ODM 的 vendor drop 里这里写死成 `#if 1`，因为他们是树外独立编 .ko、
+ * 拿不到 CONFIG_PCIE_DW_DMATEST。树内构建要走真正的 Kconfig 门——
+ * violoop_vla11.config 里已显式 CONFIG_PCIE_DW_DMATEST=y（RKEP 的 Kconfig select 它）。
+ */
 #if IS_ENABLED(CONFIG_PCIE_DW_DMATEST)
 struct dma_trx_obj *pcie_dw_dmatest_register(struct device *dev, bool irq_en);
 void pcie_dw_dmatest_unregister(struct dma_trx_obj *obj);
 int pcie_dw_wired_dma_frombus_block(struct dma_trx_obj *obj, u32 chn, u64 local_paddr, u64 bus_paddr, u32 size);
 int pcie_dw_wired_dma_tobus_block(struct dma_trx_obj *obj, u32 chn, u64 bus_paddr, u64 local_paddr, u32 size);
+int pcie_dw_dmatest_irq_en(struct dma_trx_obj *obj, bool wr_irq_en, bool rd_irq_en);
+int pcie_dw_local_dma_frombus_block(struct dma_trx_obj *obj, u32 chn,
+				    u64 local_paddr, u64 bus_paddr, u32 size);
+int pcie_dw_local_dma_tobus_block(struct dma_trx_obj *obj, u32 chn,
+				  u64 bus_paddr, u64 local_paddr, u32 size);
+int pcie_dw_dmatest_set_bandwidth(struct dma_trx_obj *obj, u8 gen, u8 lanes);
 #else
 static inline struct dma_trx_obj *pcie_dw_dmatest_register(struct device *dev, bool irq_en)
 {
@@ -23,12 +34,32 @@ static inline void pcie_dw_dmatest_unregister(struct dma_trx_obj *obj) { }
 
 static inline int pcie_dw_wired_dma_frombus_block(struct dma_trx_obj *obj, u32 chn, u64 local_paddr, u64 bus_paddr, u32 size)
 {
-	return -1;
+	return -ENODEV;
 }
 
 static inline int pcie_dw_wired_dma_tobus_block(struct dma_trx_obj *obj, u32 chn, u64 bus_paddr, u64 local_paddr, u32 size)
 {
-	return -1;
+	return -ENODEV;
+}
+
+static inline int pcie_dw_dmatest_irq_en(struct dma_trx_obj *obj, bool wr_irq_en, bool rd_irq_en)
+{
+	return -ENODEV;
+}
+
+static inline int pcie_dw_local_dma_frombus_block(struct dma_trx_obj *obj, u32 chn, u64 local_paddr, u64 bus_paddr, u32 size)
+{
+	return -ENODEV;
+}
+
+static inline int pcie_dw_local_dma_tobus_block(struct dma_trx_obj *obj, u32 chn, u64 bus_paddr, u64 local_paddr, u32 size)
+{
+	return -ENODEV;
+}
+
+static inline int pcie_dw_dmatest_set_bandwidth(struct dma_trx_obj *obj, u8 gen, u8 lanes)
+{
+	return -ENODEV;
 }
 #endif
 
