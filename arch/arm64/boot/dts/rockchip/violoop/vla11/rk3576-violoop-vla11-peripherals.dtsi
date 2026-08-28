@@ -68,13 +68,19 @@
 
 &pdm0 {
     status = "okay";
-        pinctrl-names = "default", "idle", "clk";
-        pinctrl-0 = <&pdm0m0_sdi0
-                 &pdm0m0_sdi1>;
-        pinctrl-1 = <&pdm0m0_clk0_idle
+    pinctrl-names = "default", "idle", "clk";
+    pinctrl-0 = <&pdm0m0_sdi0>;
+    pinctrl-1 = <&pdm0m0_clk0_idle
                  &pdm0m0_clk1_idle>;
-        pinctrl-2 = <&pdm0m0_clk0
-                 &pdm0m0_clk1>;
+    /*
+     * VLA11 stereo PDM uses one data line: CLK0 + SDI0.  The two
+     * microphones select opposite clock edges and become ALSA ch1/ch2.
+     * The driver selects the whole "clk" state while capturing, so keep
+     * SDI0 claimed there and leave the unused CLK1 in its idle state.
+     */
+    pinctrl-2 = <&pdm0m0_clk0
+                 &pdm0m0_sdi0
+                 &pdm0m0_clk1_idle>;
 };
 
 /**********HDMI IN-RK628F*********/
