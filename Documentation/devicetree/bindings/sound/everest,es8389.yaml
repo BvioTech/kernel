@@ -77,6 +77,14 @@ properties:
       Invert the right DAC output polarity.  This is used by boards that feed
       a differential mono power amplifier from LOUT2 and ROUT2.
 
+  everest,speaker-feedback-capture:
+    type: boolean
+    description:
+      Route both ADC PGA inputs to LIN2/RIN2 so that the differential speaker
+      output fed back into those pins is captured instead of the microphones.
+      This only sets the power-on default; the "Speaker Feedback Capture
+      Switch" mixer control selects the source at runtime.
+
   everest,dac-playback-volume:
     $ref: /schemas/types.yaml#/definitions/uint32
     minimum: 0
