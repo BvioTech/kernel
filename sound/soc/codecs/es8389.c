@@ -25,6 +25,11 @@
 
 #include "es8389.h"
 
+/* REG72/REG73 bits [6:4] select the PGA input, see es8389_pga_enum[] */
+#define ES8389_PGA_INPUT_MASK		0x70
+#define ES8389_PGA_DIFFERENTIAL		0x10
+#define ES8389_PGA1_LINE2P		0x60
+#define ES8389_PGA2_LINE2N		0x50
 
 /* codec private data */
 
@@ -71,27 +76,19 @@ static void es8389_apply_initial_volume(struct es8389_private *es8389)
 		     es8389->dac_volume);
 }
 
-#define ES8389_PGA_INPUT_MASK		0x70
-#define ES8389_PGA_DIFFERENTIAL		0x10
-#define ES8389_PGA1_LINE2P		0x60
-#define ES8389_PGA2_LINE2N		0x50
-
 /*
- * TL V4 feeds the differential MIX2052 speaker output back into ES8390
- * LIN2/RIN2 through the two 2 uF AC-coupling capacitors.  This control
- * switches both PGA inputs together; the two original vendor controls stay
- * available for low-level diagnostics.
+ * VLA11 feeds the differential MIX2052 speaker output back into the codec
+ * LIN2/RIN2 pins through two 2 uF AC-coupling capacitors.  Selecting the
+ * feedback path switches both PGA inputs together.
  */
-static int es8389_apply_capture_source(struct es8389_private *es8389)
+static int es8389_write_capture_source(struct es8389_private *es8389,
+				       bool feedback)
 {
-	unsigned int pga1 = ES8389_PGA_DIFFERENTIAL;
-	unsigned int pga2 = ES8389_PGA_DIFFERENTIAL;
+	unsigned int pga1 = feedback ? ES8389_PGA1_LINE2P
+				     : ES8389_PGA_DIFFERENTIAL;
+	unsigned int pga2 = feedback ? ES8389_PGA2_LINE2N
+				     : ES8389_PGA_DIFFERENTIAL;
 	int ret;
-
-	if (es8389->speaker_feedback_capture) {
-		pga1 = ES8389_PGA1_LINE2P;
-		pga2 = ES8389_PGA2_LINE2N;
-	}
 
 	ret = regmap_update_bits(es8389->regmap, ES8389_MIC1_GAIN_REG72,
 				 ES8389_PGA_INPUT_MASK, pga1);
@@ -100,6 +97,23 @@ static int es8389_apply_capture_source(struct es8389_private *es8389)
 
 	return regmap_update_bits(es8389->regmap, ES8389_MIC2_GAIN_REG73,
 				  ES8389_PGA_INPUT_MASK, pga2);
+}
+
+/*
+ * Replay the selection after the register block has been (re-)initialised:
+ * every register <= 0xff is volatile, so the regcache cannot restore it and
+ * es8389_init() hard-codes REG72/REG73 back to the differential mic inputs.
+ *
+ * Only the feedback path is replayed.  With the switch off the PGA inputs
+ * are left untouched, so the vendor "PGA1 Select" / "PGA2 Select" controls
+ * stay usable for low-level diagnostics.
+ */
+static int es8389_replay_capture_source(struct es8389_private *es8389)
+{
+	if (!es8389->speaker_feedback_capture)
+		return 0;
+
+	return es8389_write_capture_source(es8389, true);
 }
 
 static int es8389_feedback_capture_get(struct snd_kcontrol *kcontrol,
@@ -128,12 +142,14 @@ static int es8389_feedback_capture_put(struct snd_kcontrol *kcontrol,
 	if (enable == previous)
 		return 0;
 
-	es8389->speaker_feedback_capture = enable;
-	ret = es8389_apply_capture_source(es8389);
+	ret = es8389_write_capture_source(es8389, enable);
 	if (ret) {
-		es8389->speaker_feedback_capture = previous;
+		dev_err(component->dev,
+			"failed to select capture source: %d\n", ret);
 		return ret;
 	}
+
+	es8389->speaker_feedback_capture = enable;
 
 	return 1;
 }
@@ -772,9 +788,11 @@ static int es8389_mute(struct snd_soc_dai *dai, int mute, int direction)
 						0x03, 0x00);
 
 		} else {
-			ret = es8389_apply_capture_source(es8389);
+			ret = es8389_replay_capture_source(es8389);
 			if (ret)
-				return ret;
+				dev_err(codec->dev,
+					"failed to restore capture source: %d\n",
+					ret);
 			regmap_update_bits(es8389->regmap, ES8389_ADC_REG20,
 						0x03, 0x00);
 		}
@@ -899,7 +917,7 @@ static void es8389_init(struct snd_soc_component *codec)
 	regmap_update_bits(es8389->regmap, ES8389_DAC_REG40, 0x03, 0x03);
 	es8389_apply_output_polarity(es8389);
 	es8389_apply_initial_volume(es8389);
-	es8389_apply_capture_source(es8389);
+	es8389_replay_capture_source(es8389);
 
 	//es8389_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
 }
@@ -935,7 +953,7 @@ static int es8389_resume(struct snd_soc_component *codec)
 	regcache_sync(es8389->regmap);
 	es8389_apply_output_polarity(es8389);
 	es8389_apply_initial_volume(es8389);
-	es8389_apply_capture_source(es8389);
+	es8389_replay_capture_source(es8389);
 
 	return 0;
 }
@@ -972,8 +990,8 @@ static int es8389_probe(struct snd_soc_component *codec)
 			"everest,invert-right-output");
 	es8389->speaker_feedback_capture = device_property_read_bool(codec->dev,
 			"everest,speaker-feedback-capture");
-	dev_info(codec->dev, "speaker feedback capture %s\n",
-		 es8389->speaker_feedback_capture ? "enabled" : "disabled");
+	dev_dbg(codec->dev, "speaker-feedback-capture %d\n",
+		es8389->speaker_feedback_capture);
 	if (!device_property_read_u32(codec->dev,
 				      "everest,dac-playback-volume", &volume)) {
 		es8389->dac_volume_configured = true;
