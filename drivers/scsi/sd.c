@@ -99,6 +99,8 @@ MODULE_ALIAS_SCSI_DEVICE(TYPE_ZBC);
 
 #define SD_MINORS	16
 
+#define SD_KM8V7001JM_B810_MAX_SECTORS	1024 /* 512 KiB */
+
 static void sd_config_discard(struct scsi_disk *, unsigned int);
 static void sd_config_write_same(struct scsi_disk *);
 static int  sd_revalidate_disk(struct gendisk *);
@@ -130,6 +132,13 @@ static const char *sd_cache_types[] = {
 	"write through", "none", "write back",
 	"write back, no read (daft)"
 };
+
+static bool sd_quirk_km8v7001jm_b810(const struct scsi_device *sdp)
+{
+	return !strncmp(sdp->vendor, "SAMSUNG", sizeof("SAMSUNG") - 1) &&
+	       !strncmp(sdp->model, "KM8V7001JM-B810",
+			sizeof("KM8V7001JM-B810") - 1);
+}
 
 static void sd_set_flush_flag(struct scsi_disk *sdkp)
 {
@@ -3421,6 +3430,23 @@ static int sd_revalidate_disk(struct gendisk *disk)
 
 	/* Do not exceed controller limit */
 	rw_max = min(rw_max, queue_max_hw_sectors(q));
+
+	/*
+	 * KM8V7001JM-B810 advertises an 8 KiB optimal transfer size through
+	 * VPD page B0. That value unnecessarily limits request merging on this
+	 * UFS device. Use its documented 512 KiB transfer unit while retaining
+	 * the device and controller limits.
+	 */
+	if (sd_quirk_km8v7001jm_b810(sdp)) {
+		rw_max = min_t(unsigned int,
+			       SD_KM8V7001JM_B810_MAX_SECTORS,
+			       q->limits.max_dev_sectors);
+		rw_max = min_t(unsigned int, rw_max,
+			       queue_max_hw_sectors(q));
+		if (sdkp->first_scan)
+			sd_printk(KERN_INFO, sdkp,
+				  "using %u KiB max I/O size\n", rw_max >> 1);
+	}
 
 	/*
 	 * Only update max_sectors if previously unset or if the current value
