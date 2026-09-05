@@ -279,6 +279,10 @@
     hym8563: hym8563@51 {
         compatible = "haoyu,hym8563";
         reg = <0x51>;
+        pinctrl-names = "default";
+        pinctrl-0 = <&vla11_rtc_int>;
+        interrupt-parent = <&gpio2>;
+        interrupts = <RK_PC7 IRQ_TYPE_LEVEL_LOW>;
         #clock-cells = <0>;
         clock-frequency = <32768>;
         clock-output-names = "hym8563";
@@ -375,6 +379,11 @@
 };
 
 &pinctrl {
+	rtc {
+		vla11_rtc_int: vla11-rtc-int {
+			rockchip,pins = <2 RK_PC7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
 
 
 	touch {
