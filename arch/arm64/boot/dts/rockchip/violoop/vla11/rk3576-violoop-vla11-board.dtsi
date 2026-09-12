@@ -270,6 +270,16 @@
              &sai1m0_sdo0>;
 };
 
+/* AIC8800D40 hardware SCO/PCM link: SAI2 M2, no external MCLK pin. */
+&sai2 {
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = <&sai2m2_lrck
+             &sai2m2_sclk
+             &sai2m2_sdi
+             &sai2m2_sdo>;
+};
+
 /**********3.92寸屏幕**********/
 
 /*
