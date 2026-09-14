@@ -8,6 +8,27 @@
 #include "../../rk3576-rk806.dtsi"
 
 / {
+	/*
+	 * Shared physical key sampled by RK3576 GPIO0_C0 and the STM32.
+	 * RK3576 is input-only here: a low level means pressed. The board provides
+         * the external pull-up and diode isolation, so the SoC bias stays disabled.
+         * KEY_PROG1 has no product action and remains a generic userspace input.
+	 */
+	violoop_shared_key: violoop-shared-key {
+		compatible = "gpio-keys";
+		label = "violoop-func-key";
+		pinctrl-names = "default";
+		pinctrl-0 = <&violoop_shared_key_gpio>;
+		status = "okay";
+
+		shared-key {
+			label = "violoop-gpio0-c0";
+			linux,code = <KEY_PROG1>;
+			gpios = <&gpio0 RK_PC0 GPIO_ACTIVE_LOW>;
+			debounce-interval = <30>;
+		};
+	};
+
 	es8389_sound: es8389-sound {
         status = "okay";
         compatible = "rockchip,multicodecs-card";
@@ -334,6 +355,12 @@
 
 
 &pinctrl {
+	keys {
+		violoop_shared_key_gpio: violoop-shared-key-gpio {
+			rockchip,pins = <0 RK_PC0 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
 	lcd {
 		/* GPIO4_C7 drives U26 SHDN; keep it low until the regulator enables VCI. */
 		lcd_vci_en: lcd-vci-en {

@@ -49,7 +49,7 @@ MODULE_PARM_DESC(debug, "debug level (0-3)");
 #define LT7911EXC_FW_CRC_ADDR		(LT7911EXC_FW_SIZE - 4)
 #define LT7911EXC_FW_PAGE_SIZE		32
 #define LT7911EXC_FW_FILE \
-	"violoop/lt7911exc/LT7911EXC_U2Q02CEM_FCS01x870BF9(CSx600856_CRCx74101F2A).bin"
+	"violoop/lt7911exc/LT7911EXC_U2Q02CEM_FCS01x89FB76(CSx5D7D39_CRCx22AC1AFE).bin"
 
 #define LT7911EXC_LINK_FREQ_1250M	1250000000
 #define LT7911EXC_LINK_FREQ_860M	860000000
@@ -144,6 +144,7 @@ struct lt7911exc {
 	struct i2c_client *i2c_client;
 	struct mutex confctl_mutex;
 	struct mutex fw_lock;
+	struct mutex io_lock;
 	struct v4l2_ctrl *detect_tx_5v_ctrl;
 	struct v4l2_ctrl *audio_sampling_rate_ctrl;
 	struct v4l2_ctrl *audio_present_ctrl;
@@ -156,6 +157,19 @@ struct lt7911exc {
 	struct gpio_desc *reset_gpio;
 	struct gpio_desc *plugin_det_gpio;
 	struct gpio_desc *power_gpio;
+	struct gpio_desc *cc_enable_gpio;
+	bool no_reset_on_power_on;
+	bool hw_powered;
+	bool runtime_paused;
+	bool streaming;
+	bool resume_power;
+	bool system_suspended;
+	bool removing;
+	bool work_initialized;
+	bool irq_requested;
+	bool poll_started;
+	bool subdev_registered;
+	u32 power_on_delay_ms;
 	struct work_struct work_i2c_poll;
 	struct timer_list timer;
 	const char *module_facing;
@@ -364,13 +378,24 @@ static void lt7911exc_format_change(struct v4l2_subdev *sd);
 static int lt7911exc_s_ctrl_detect_tx_5v(struct v4l2_subdev *sd);
 static int lt7911exc_s_dv_timings(struct v4l2_subdev *sd,
 				struct v4l2_dv_timings *timings);
+static int lt7911exc_check_chip_id(struct lt7911exc *lt7911exc);
+static ssize_t link_enable_show(struct device *dev,
+		struct device_attribute *attr, char *buf);
+static ssize_t link_enable_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t registers_show(struct device *dev,
+		struct device_attribute *attr, char *buf);
+static ssize_t link_status_show(struct device *dev,
+		struct device_attribute *attr, char *buf);
+static int lt7911exc_link_on(struct lt7911exc *lt7911exc);
+static void lt7911exc_link_off(struct lt7911exc *lt7911exc);
 
 static inline struct lt7911exc *to_lt7911exc(struct v4l2_subdev *sd)
 {
 	return container_of(sd, struct lt7911exc, sd);
 }
 
-static void i2c_rd(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
+static int i2c_rd(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 {
 	struct lt7911exc *lt7911exc = to_lt7911exc(sd);
 	struct i2c_client *client = lt7911exc->i2c_client;
@@ -379,9 +404,12 @@ static void i2c_rd(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 	u8 reg_addr = reg & 0xFF;
 	struct i2c_msg msgs[3];
 
-	if (READ_ONCE(lt7911exc->fw_update_active)) {
-		memset(values, 0, n);
-		return;
+	memset(values, 0, n);
+	mutex_lock(&lt7911exc->io_lock);
+	if (!lt7911exc->hw_powered || lt7911exc->fw_update_active) {
+		err = lt7911exc->hw_powered ? -EBUSY : -EHOSTDOWN;
+		mutex_unlock(&lt7911exc->io_lock);
+		return err;
 	}
 
 	msgs[0].addr = client->addr;
@@ -400,13 +428,16 @@ static void i2c_rd(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 	msgs[2].buf = values;
 
 	err = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+	mutex_unlock(&lt7911exc->io_lock);
 	if (err != ARRAY_SIZE(msgs)) {
 		v4l2_err(sd, "%s: reading register 0x%x from 0x%x failed\n",
 				__func__, reg, client->addr);
+		memset(values, 0, n);
+		return err < 0 ? err : -EIO;
 	}
 
 	if (!debug)
-		return;
+		return 0;
 
 	switch (n) {
 	case 1:
@@ -425,9 +456,10 @@ static void i2c_rd(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 		v4l2_info(sd, "I2C read %d bytes from address 0x%04x\n",
 			n, reg);
 	}
+	return 0;
 }
 
-static void i2c_wr(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
+static int i2c_wr(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 {
 	struct lt7911exc *lt7911exc = to_lt7911exc(sd);
 	struct i2c_client *client = lt7911exc->i2c_client;
@@ -436,8 +468,12 @@ static void i2c_wr(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 	u8 data[I2C_MAX_XFER_SIZE];
 	u8 buf[2] = { 0xFF, reg >> 8};
 
-	if (READ_ONCE(lt7911exc->fw_update_active))
-		return;
+	mutex_lock(&lt7911exc->io_lock);
+	if (!lt7911exc->hw_powered || lt7911exc->fw_update_active) {
+		err = lt7911exc->hw_powered ? -EBUSY : -EHOSTDOWN;
+		mutex_unlock(&lt7911exc->io_lock);
+		return err;
+	}
 
 	if ((1 + n) > I2C_MAX_XFER_SIZE) {
 		n = I2C_MAX_XFER_SIZE - 1;
@@ -460,14 +496,15 @@ static void i2c_wr(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 		data[1 + i] = values[i];
 
 	err = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
-	if (err < 0) {
+	mutex_unlock(&lt7911exc->io_lock);
+	if (err != ARRAY_SIZE(msgs)) {
 		v4l2_err(sd, "%s: writing register 0x%x from 0x%x failed\n",
 				__func__, reg, client->addr);
-		return;
+		return err < 0 ? err : -EIO;
 	}
 
 	if (!debug)
-		return;
+		return 0;
 
 	switch (n) {
 	case 1:
@@ -486,6 +523,7 @@ static void i2c_wr(struct v4l2_subdev *sd, u16 reg, u8 *values, u32 n)
 		v4l2_info(sd, "I2C write %d bytes from address 0x%04x\n",
 				n, reg);
 	}
+	return 0;
 }
 
 static u8 i2c_rd8(struct v4l2_subdev *sd, u16 reg)
@@ -499,16 +537,6 @@ static u8 i2c_rd8(struct v4l2_subdev *sd, u16 reg)
 static void i2c_wr8(struct v4l2_subdev *sd, u16 reg, u8 val)
 {
 	i2c_wr(sd, reg, &val, 1);
-}
-
-static void lt7911exc_i2c_enable(struct v4l2_subdev *sd)
-{
-	i2c_wr8(sd, I2C_EN_REG, I2C_ENABLE);
-}
-
-static void lt7911exc_i2c_disable(struct v4l2_subdev *sd)
-{
-	i2c_wr8(sd, I2C_EN_REG, I2C_DISABLE);
 }
 
 /*
@@ -859,42 +887,58 @@ static int lt7911exc_fw_write_crc(struct lt7911exc *lt7911exc, u32 crc)
 
 static void lt7911exc_fw_pause_runtime(struct lt7911exc *lt7911exc)
 {
-	if (!lt7911exc->runtime_registered)
+	if (!lt7911exc->work_initialized || lt7911exc->runtime_paused)
 		return;
+	WRITE_ONCE(lt7911exc->runtime_paused, true);
 
-	if (lt7911exc->i2c_client->irq)
+	if (lt7911exc->irq_requested)
 		disable_irq(lt7911exc->i2c_client->irq);
-	else {
+	else if (lt7911exc->poll_started) {
 		del_timer_sync(&lt7911exc->timer);
 		cancel_work_sync(&lt7911exc->work_i2c_poll);
 	}
+	if (lt7911exc->plugin_irq > 0)
+		disable_irq(lt7911exc->plugin_irq);
 	cancel_delayed_work_sync(&lt7911exc->delayed_work_hotplug);
 	cancel_delayed_work_sync(&lt7911exc->delayed_work_res_change);
 }
 
 static void lt7911exc_fw_resume_runtime(struct lt7911exc *lt7911exc)
 {
-	if (!lt7911exc->runtime_registered)
+	if (!lt7911exc->runtime_registered || !lt7911exc->runtime_paused ||
+	    !lt7911exc->hw_powered)
 		return;
+	WRITE_ONCE(lt7911exc->runtime_paused, false);
 
 	if (lt7911exc->i2c_client->irq)
 		enable_irq(lt7911exc->i2c_client->irq);
 	else
 		mod_timer(&lt7911exc->timer,
 			  jiffies + msecs_to_jiffies(POLL_INTERVAL_MS));
+	if (lt7911exc->plugin_irq > 0)
+		enable_irq(lt7911exc->plugin_irq);
 	schedule_delayed_work(&lt7911exc->delayed_work_res_change,
 			      msecs_to_jiffies(POLL_INTERVAL_MS));
 }
 
 static int lt7911exc_fw_begin(struct lt7911exc *lt7911exc)
 {
-	mutex_lock(&lt7911exc->fw_lock);
-	if (lt7911exc->fw_update_active) {
+	if (!mutex_trylock(&lt7911exc->fw_lock))
+		return -EBUSY;
+	if (lt7911exc->streaming || lt7911exc->system_suspended ||
+	    lt7911exc->removing) {
 		mutex_unlock(&lt7911exc->fw_lock);
 		return -EBUSY;
 	}
-	WRITE_ONCE(lt7911exc->fw_update_active, true);
+	if (!lt7911exc->hw_powered) {
+		mutex_unlock(&lt7911exc->fw_lock);
+		return -EHOSTDOWN;
+	}
 	lt7911exc_fw_pause_runtime(lt7911exc);
+	/* Drain any in-flight normal register transfer before flash ownership. */
+	mutex_lock(&lt7911exc->io_lock);
+	WRITE_ONCE(lt7911exc->fw_update_active, true);
+	mutex_unlock(&lt7911exc->io_lock);
 	usleep_range(20000, 25000);
 	return 0;
 }
@@ -902,7 +946,9 @@ static int lt7911exc_fw_begin(struct lt7911exc *lt7911exc)
 static void lt7911exc_fw_end(struct lt7911exc *lt7911exc)
 {
 	lt7911exc_fw_release_flash(lt7911exc);
+	mutex_lock(&lt7911exc->io_lock);
 	WRITE_ONCE(lt7911exc->fw_update_active, false);
+	mutex_unlock(&lt7911exc->io_lock);
 	lt7911exc_fw_resume_runtime(lt7911exc);
 	mutex_unlock(&lt7911exc->fw_lock);
 }
@@ -995,9 +1041,15 @@ static ssize_t firmware_update_store(struct device *dev,
 }
 
 static DEVICE_ATTR_WO(firmware_update);
+static DEVICE_ATTR_RW(link_enable);
+static DEVICE_ATTR_RO(registers);
+static DEVICE_ATTR_RO(link_status);
 
 static struct attribute *lt7911exc_fw_attrs[] = {
 	&dev_attr_firmware_update.attr,
+	&dev_attr_link_enable.attr,
+	&dev_attr_registers.attr,
+	&dev_attr_link_status.attr,
 	NULL,
 };
 
@@ -1283,6 +1335,9 @@ static void lt7911exc_delayed_work_hotplug(struct work_struct *work)
 			struct lt7911exc, delayed_work_hotplug);
 	struct v4l2_subdev *sd = &lt7911exc->sd;
 
+	if (READ_ONCE(lt7911exc->runtime_paused) ||
+	    !READ_ONCE(lt7911exc->hw_powered))
+		return;
 	lt7911exc_s_ctrl_detect_tx_5v(sd);
 }
 
@@ -1306,6 +1361,9 @@ static void lt7911exc_delayed_work_res_change(struct work_struct *work)
 			struct lt7911exc, delayed_work_res_change);
 	struct v4l2_subdev *sd = &lt7911exc->sd;
 
+	if (READ_ONCE(lt7911exc->runtime_paused) ||
+	    !READ_ONCE(lt7911exc->hw_powered))
+		return;
 	/*
 	 * The interrupt is requested early in probe.  A bridge that is already
 	 * running may pulse INT before controls and the subdevice are ready.
@@ -1369,11 +1427,21 @@ static int lt7911exc_update_controls(struct v4l2_subdev *sd)
 static void lt7911exc_cphy_timing_config(struct v4l2_subdev *sd)
 {
 	struct lt7911exc *lt7911exc = to_lt7911exc(sd);
+	int retry;
 
 	if (lt7911exc->bus_cfg.bus_type == V4L2_MBUS_CSI2_CPHY) {
-		while (i2c_rd8(sd, HS_RQST_PRE_REG) != 0x3c) {
+		for (retry = 0; retry < 100; retry++) {
+			if (!READ_ONCE(lt7911exc->hw_powered) ||
+			    READ_ONCE(lt7911exc->fw_update_active))
+				return;
+			if (i2c_rd8(sd, HS_RQST_PRE_REG) == 0x3c)
+				break;
 			i2c_wr8(sd, HS_RQST_PRE_REG, 0x3c);
 			usleep_range(500, 600);
+		}
+		if (retry == 100) {
+			v4l2_err(sd, "C-PHY timing configuration timed out\n");
+			return;
 		}
 		// i2c_wr8(sd, HS_TRAIL, 0x0b);
 	}
@@ -1536,6 +1604,10 @@ static int lt7911exc_isr(struct v4l2_subdev *sd, u32 status, bool *handled)
 	struct device *dev = &lt7911exc->i2c_client->dev;
 	u8 event;
 
+	*handled = true;
+	if (READ_ONCE(lt7911exc->runtime_paused) ||
+	    !READ_ONCE(lt7911exc->hw_powered))
+		return 0;
 	/*
 	 * INT is an active-low pulse lasting only about 20 ms.  Do not defer
 	 * register sampling by the old 50 ms delay, otherwise E0:84 may already
@@ -1566,6 +1638,9 @@ static irqreturn_t plugin_detect_irq_handler(int irq, void *dev_id)
 {
 	struct lt7911exc *lt7911exc = dev_id;
 
+	if (READ_ONCE(lt7911exc->runtime_paused) ||
+	    !READ_ONCE(lt7911exc->hw_powered))
+		return IRQ_HANDLED;
 	/* control hpd output level after 25ms */
 	schedule_delayed_work(&lt7911exc->delayed_work_hotplug,
 			HZ / 40);
@@ -1577,6 +1652,8 @@ static void lt7911exc_irq_poll_timer(struct timer_list *t)
 {
 	struct lt7911exc *lt7911exc = from_timer(lt7911exc, t, timer);
 
+	if (READ_ONCE(lt7911exc->runtime_paused))
+		return;
 	schedule_work(&lt7911exc->work_i2c_poll);
 	mod_timer(&lt7911exc->timer, jiffies + msecs_to_jiffies(POLL_INTERVAL_MS));
 }
@@ -1587,6 +1664,9 @@ static void lt7911exc_work_i2c_poll(struct work_struct *work)
 			struct lt7911exc, work_i2c_poll);
 	struct v4l2_subdev *sd = &lt7911exc->sd;
 
+	if (READ_ONCE(lt7911exc->runtime_paused) ||
+	    !READ_ONCE(lt7911exc->initialized))
+		return;
 	lt7911exc_format_change(sd);
 }
 
@@ -1642,6 +1722,8 @@ static int lt7911exc_g_dv_timings(struct v4l2_subdev *sd,
 {
 	struct lt7911exc *lt7911exc = to_lt7911exc(sd);
 
+	if (!READ_ONCE(lt7911exc->initialized))
+		return -EHOSTDOWN;
 	*timings = lt7911exc->timings;
 
 	return 0;
@@ -1662,6 +1744,8 @@ static int lt7911exc_query_dv_timings(struct v4l2_subdev *sd,
 {
 	struct lt7911exc *lt7911exc = to_lt7911exc(sd);
 
+	if (!READ_ONCE(lt7911exc->initialized))
+		return -EHOSTDOWN;
 	*timings = lt7911exc->timings;
 	if (debug)
 		v4l2_print_dv_timings(sd->name,
@@ -1702,9 +1786,27 @@ static int lt7911exc_g_mbus_config(struct v4l2_subdev *sd,
 
 static int lt7911exc_s_stream(struct v4l2_subdev *sd, int on)
 {
-	enable_stream(sd, on);
+	struct lt7911exc *lt7911exc = to_lt7911exc(sd);
+	int ret = 0;
 
-	return 0;
+	if (on) {
+		if (!mutex_trylock(&lt7911exc->fw_lock))
+			return -EBUSY;
+	} else {
+		/* STREAMOFF must clear ownership even if a status read is finishing. */
+		mutex_lock(&lt7911exc->fw_lock);
+	}
+	if (on && (!lt7911exc->initialized || lt7911exc->system_suspended ||
+		   lt7911exc->removing)) {
+		ret = -EHOSTDOWN;
+		goto out;
+	}
+	if (lt7911exc->hw_powered)
+		enable_stream(sd, on);
+	lt7911exc->streaming = !!on;
+out:
+	mutex_unlock(&lt7911exc->fw_lock);
+	return ret;
 }
 
 static int lt7911exc_enum_mbus_code(struct v4l2_subdev *sd,
@@ -2146,6 +2248,21 @@ static int lt7911exc_probe_of(struct lt7911exc *lt7911exc)
 		return -EINVAL;
 	}
 
+	/* Logical zero isolates CC (CH442E EN# is active low) before power off. */
+	lt7911exc->cc_enable_gpio = devm_gpiod_get_optional(dev, "cc-enable",
+			GPIOD_OUT_LOW);
+	if (IS_ERR(lt7911exc->cc_enable_gpio))
+		return dev_err_probe(dev, PTR_ERR(lt7911exc->cc_enable_gpio),
+				     "failed to get CC enable gpio\n");
+
+	lt7911exc->no_reset_on_power_on =
+		of_property_read_bool(node, "lontium,no-reset-on-power-on");
+	lt7911exc->power_on_delay_ms = 30;
+	of_property_read_u32(node, "lontium,power-on-delay-ms",
+			     &lt7911exc->power_on_delay_ms);
+	if (lt7911exc->power_on_delay_ms > 1000)
+		return dev_err_probe(dev, -EINVAL, "power-on delay exceeds 1000 ms\n");
+
 	lt7911exc->power_gpio = devm_gpiod_get_optional(dev, "power",
 			GPIOD_OUT_LOW);
 	if (IS_ERR(lt7911exc->power_gpio)) {
@@ -2155,7 +2272,7 @@ static int lt7911exc_probe_of(struct lt7911exc *lt7911exc)
 	}
 
 	lt7911exc->reset_gpio = devm_gpiod_get_optional(dev, "reset",
-			GPIOD_OUT_HIGH);
+			lt7911exc->no_reset_on_power_on ? GPIOD_OUT_LOW : GPIOD_OUT_HIGH);
 	if (IS_ERR(lt7911exc->reset_gpio)) {
 		dev_err(dev, "failed to get reset gpio\n");
 		ret = PTR_ERR(lt7911exc->reset_gpio);
@@ -2226,32 +2343,57 @@ static int __lt7911exc_power_on(struct lt7911exc *lt7911exc)
 {
 	struct device *dev = &lt7911exc->i2c_client->dev;
 
-	dev_info(dev, "lt7911exc power on\n");
-	if (lt7911exc->reset_gpio)
-		gpiod_set_value(lt7911exc->reset_gpio, 1);
+	if (lt7911exc->cc_enable_gpio)
+		gpiod_set_value_cansleep(lt7911exc->cc_enable_gpio, 0);
+	if (lt7911exc->reset_gpio && !lt7911exc->no_reset_on_power_on)
+		gpiod_set_value_cansleep(lt7911exc->reset_gpio, 1);
 	usleep_range(20000, 25000);
 	if (lt7911exc->power_gpio)
-		gpiod_set_value(lt7911exc->power_gpio, 1);
-	//delay 20ms before reset
+		gpiod_set_value_cansleep(lt7911exc->power_gpio, 1);
+	mutex_lock(&lt7911exc->io_lock);
+	WRITE_ONCE(lt7911exc->hw_powered, true);
+	mutex_unlock(&lt7911exc->io_lock);
+	dev_info(dev, "power on: CC isolated, reset %s, settling %u ms\n",
+		 lt7911exc->no_reset_on_power_on ? "released (no pulse)" : "asserted",
+		 lt7911exc->power_on_delay_ms);
 	usleep_range(25000, 30000);
-	if (lt7911exc->reset_gpio)
-		gpiod_set_value(lt7911exc->reset_gpio, 0);
-	usleep_range(25000, 30000);
+	if (lt7911exc->reset_gpio && !lt7911exc->no_reset_on_power_on)
+		gpiod_set_value_cansleep(lt7911exc->reset_gpio, 0);
+	msleep(lt7911exc->power_on_delay_ms);
 
 	return 0;
 }
 
-static void __lt7911exc_power_off(struct lt7911exc *lt7911exc)
+static void lt7911exc_connect_cc(struct lt7911exc *lt7911exc)
 {
+	if (lt7911exc->cc_enable_gpio) {
+		gpiod_set_value_cansleep(lt7911exc->cc_enable_gpio, 1);
+		dev_info(&lt7911exc->i2c_client->dev, "CC connected: bridge driver ready\n");
+	}
+}
+
+static void __lt7911exc_power_off(void *data)
+{
+	struct lt7911exc *lt7911exc = data;
 	struct device *dev = &lt7911exc->i2c_client->dev;
 
-	dev_info(dev, "lt7911exc power off\n");
+	if (!lt7911exc->hw_powered)
+		return;
+	/* Wait for the last normal I2C transfer before removing the supplies. */
+	mutex_lock(&lt7911exc->io_lock);
+	if (lt7911exc->cc_enable_gpio) {
+		gpiod_set_value_cansleep(lt7911exc->cc_enable_gpio, 0);
+		usleep_range(1000, 2000);
+	}
 
-	if (lt7911exc->reset_gpio && !IS_ERR(lt7911exc->reset_gpio))
-		gpiod_set_value(lt7911exc->reset_gpio, 1);
+	if (lt7911exc->reset_gpio && !lt7911exc->no_reset_on_power_on)
+		gpiod_set_value_cansleep(lt7911exc->reset_gpio, 1);
 
-	if (lt7911exc->power_gpio && !IS_ERR(lt7911exc->power_gpio))
-		gpiod_set_value(lt7911exc->power_gpio, 0);
+	if (lt7911exc->power_gpio)
+		gpiod_set_value_cansleep(lt7911exc->power_gpio, 0);
+	WRITE_ONCE(lt7911exc->hw_powered, false);
+	mutex_unlock(&lt7911exc->io_lock);
+	dev_info(dev, "power off: CC isolated before supplies disabled\n");
 }
 
 static int lt7911exc_resume(struct device *dev)
@@ -2259,8 +2401,18 @@ static int lt7911exc_resume(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct lt7911exc *lt7911exc = to_lt7911exc(sd);
+	int ret = 0;
 
-	return __lt7911exc_power_on(lt7911exc);
+	mutex_lock(&lt7911exc->fw_lock);
+	if (lt7911exc->resume_power) {
+		if (lt7911exc->runtime_registered)
+			ret = lt7911exc_link_on(lt7911exc);
+		else
+			ret = __lt7911exc_power_on(lt7911exc);
+	}
+	lt7911exc->system_suspended = false;
+	mutex_unlock(&lt7911exc->fw_lock);
+	return ret;
 }
 
 static int lt7911exc_suspend(struct device *dev)
@@ -2269,7 +2421,15 @@ static int lt7911exc_suspend(struct device *dev)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct lt7911exc *lt7911exc = to_lt7911exc(sd);
 
-	__lt7911exc_power_off(lt7911exc);
+	mutex_lock(&lt7911exc->fw_lock);
+	if (lt7911exc->streaming) {
+		mutex_unlock(&lt7911exc->fw_lock);
+		return -EBUSY;
+	}
+	lt7911exc->resume_power = lt7911exc->hw_powered;
+	lt7911exc->system_suspended = true;
+	lt7911exc_link_off(lt7911exc);
+	mutex_unlock(&lt7911exc->fw_lock);
 
 	return 0;
 }
@@ -2283,14 +2443,21 @@ static int lt7911exc_check_chip_id(struct lt7911exc *lt7911exc)
 {
 	struct device *dev = &lt7911exc->i2c_client->dev;
 	struct v4l2_subdev *sd = &lt7911exc->sd;
-	u8 id_h, id_l;
+	u8 id_h, id_l, value;
 	u32 chipid;
-	int ret = 0;
+	int ret, disable_ret;
 
-	lt7911exc_i2c_enable(sd);
-	id_l  = i2c_rd8(sd, CHIPID_REGL);
-	id_h  = i2c_rd8(sd, CHIPID_REGH);
-	lt7911exc_i2c_disable(sd);
+	value = I2C_ENABLE;
+	ret = i2c_wr(sd, I2C_EN_REG, &value, 1);
+	if (ret)
+		return ret;
+	ret = i2c_rd(sd, CHIPID_REGL, &id_l, 1);
+	if (!ret)
+		ret = i2c_rd(sd, CHIPID_REGH, &id_h, 1);
+	value = I2C_DISABLE;
+	disable_ret = i2c_wr(sd, I2C_EN_REG, &value, 1);
+	if (ret || disable_ret)
+		return ret ? ret : disable_ret;
 
 	chipid = (id_h << 8) | id_l;
 	if (chipid != LT7911EXC_CHIPID) {
@@ -2300,6 +2467,123 @@ static int lt7911exc_check_chip_id(struct lt7911exc *lt7911exc)
 	}
 	dev_info(dev, "check chipid ok, id:%#x", chipid);
 
+	return ret;
+}
+
+/* fw_lock owns link transitions and capture/update exclusion, not IRQ work. */
+static int lt7911exc_link_on(struct lt7911exc *lt7911exc)
+{
+	int ret, retry;
+
+	if (lt7911exc->initialized)
+		return 0;
+	if (!lt7911exc->runtime_registered)
+		return -ENODEV;
+	__lt7911exc_power_on(lt7911exc);
+	for (retry = 0; retry < 10; retry++) {
+		ret = lt7911exc_check_chip_id(lt7911exc);
+		if (!ret)
+			break;
+		msleep(50);
+	}
+	if (ret) {
+		__lt7911exc_power_off(lt7911exc);
+		dev_err(&lt7911exc->i2c_client->dev,
+			"link enable failed: %d; CC isolated, power off\n", ret);
+		return ret;
+	}
+	lt7911exc->nosignal = true;
+	enable_stream(&lt7911exc->sd, false);
+	WRITE_ONCE(lt7911exc->initialized, true);
+	lt7911exc_fw_resume_runtime(lt7911exc);
+	lt7911exc_connect_cc(lt7911exc);
+	return 0;
+}
+
+static void lt7911exc_link_off(struct lt7911exc *lt7911exc)
+{
+	lt7911exc_fw_pause_runtime(lt7911exc);
+	WRITE_ONCE(lt7911exc->initialized, false);
+	__lt7911exc_power_off(lt7911exc);
+	lt7911exc->nosignal = true;
+	lt7911exc->is_audio_present = false;
+	lt7911exc->audio_sampling_rate = 0;
+}
+
+static ssize_t link_enable_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct lt7911exc *lt = to_lt7911exc(i2c_get_clientdata(to_i2c_client(dev)));
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(lt->initialized));
+}
+
+static ssize_t link_status_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct lt7911exc *lt = to_lt7911exc(i2c_get_clientdata(to_i2c_client(dev)));
+
+	/* A cached snapshot: reading status never initiates an I2C transaction. */
+	return sysfs_emit(buf, "powered=%u ready=%u streaming=%u updating=%u suspended=%u\n",
+		READ_ONCE(lt->hw_powered), READ_ONCE(lt->initialized),
+		READ_ONCE(lt->streaming), READ_ONCE(lt->fw_update_active),
+		READ_ONCE(lt->system_suspended));
+}
+
+static ssize_t link_enable_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct lt7911exc *lt = to_lt7911exc(i2c_get_clientdata(to_i2c_client(dev)));
+	bool on;
+	int ret;
+
+	ret = kstrtobool(buf, &on);
+	if (ret)
+		return ret;
+	if (!lt->power_gpio || !lt->cc_enable_gpio)
+		return -EOPNOTSUPP;
+	if (!mutex_trylock(&lt->fw_lock))
+		return -EBUSY;
+	if (lt->streaming || lt->system_suspended || lt->removing) {
+		ret = -EBUSY;
+		goto out;
+	}
+	dev_info(dev, "link control request: %s\n", on ? "on" : "off");
+	if (on)
+		ret = lt7911exc_link_on(lt);
+	else {
+		lt7911exc_link_off(lt);
+		ret = 0;
+	}
+out:
+	mutex_unlock(&lt->fw_lock);
+	return ret ? ret : count;
+}
+
+static ssize_t registers_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct lt7911exc *lt = to_lt7911exc(i2c_get_clientdata(to_i2c_client(dev)));
+	u8 event = 0;
+	int ret;
+
+	if (!mutex_trylock(&lt->fw_lock))
+		return -EBUSY;
+	if (!lt->initialized || lt->system_suspended || lt->removing) {
+		ret = -EHOSTDOWN;
+		goto out;
+	}
+	/* Use the driver's real chip ID registers; never force I2C ownership. */
+	lt7911exc_fw_pause_runtime(lt);
+	ret = lt7911exc_check_chip_id(lt);
+	if (!ret)
+		ret = i2c_rd(&lt->sd, LT7911EXC_VIDEO_STATUS, &event, 1);
+	lt7911exc_fw_resume_runtime(lt);
+	if (!ret)
+		ret = sysfs_emit(buf, "chip_id=0x%04x video_status=0x%02x\n",
+				 LT7911EXC_CHIPID, event);
+out:
+	mutex_unlock(&lt->fw_lock);
 	return ret;
 }
 
@@ -2328,6 +2612,7 @@ static int lt7911exc_probe(struct i2c_client *client,
 	lt7911exc->mbus_fmt_code = LT7911EXC_MEDIA_BUS_FMT;
 	i2c_set_clientdata(client, sd);
 	mutex_init(&lt7911exc->fw_lock);
+	mutex_init(&lt7911exc->io_lock);
 
 	err = lt7911exc_probe_of(lt7911exc);
 	if (err) {
@@ -2340,23 +2625,21 @@ static int lt7911exc_probe(struct i2c_client *client,
 	lt7911exc->nosignal = true;
 
 	__lt7911exc_power_on(lt7911exc);
-	err = devm_device_add_group(dev, &lt7911exc_fw_attr_group);
-	if (err) {
-		dev_err(dev, "failed to create firmware maintenance interface: %d\n",
-			err);
+	err = devm_add_action_or_reset(dev, __lt7911exc_power_off, lt7911exc);
+	if (err)
 		return err;
-	}
 	err = lt7911exc_check_chip_id(lt7911exc);
 	if (err < 0) {
 		dev_warn(dev,
 			 "runtime firmware not detected; I2C firmware updater remains available\n");
-		return 0;
+		return devm_device_add_group(dev, &lt7911exc_fw_attr_group);
 	}
 
 	INIT_DELAYED_WORK(&lt7911exc->delayed_work_hotplug,
 			lt7911exc_delayed_work_hotplug);
 	INIT_DELAYED_WORK(&lt7911exc->delayed_work_res_change,
 			lt7911exc_delayed_work_res_change);
+	lt7911exc->work_initialized = true;
 
 	if (lt7911exc->i2c_client->irq) {
 		dev_info(dev, "using active-low falling-edge IRQ %d\n",
@@ -2370,12 +2653,14 @@ static int lt7911exc_probe(struct i2c_client *client,
 			v4l2_err(sd, "request irq failed! err:%d\n", err);
 			goto err_work_queues;
 		}
+		lt7911exc->irq_requested = true;
 	} else {
 		v4l2_dbg(1, debug, sd, "no irq, cfg poll!\n");
 		INIT_WORK(&lt7911exc->work_i2c_poll, lt7911exc_work_i2c_poll);
 		timer_setup(&lt7911exc->timer, lt7911exc_irq_poll_timer, 0);
 		lt7911exc->timer.expires = jiffies +
 				       msecs_to_jiffies(POLL_INTERVAL_MS);
+		lt7911exc->poll_started = true;
 		add_timer(&lt7911exc->timer);
 	}
 
@@ -2391,10 +2676,12 @@ static int lt7911exc_probe(struct i2c_client *client,
 					IRQF_TRIGGER_FALLING |
 					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
 					"lt7911exc", lt7911exc);
-			if (err)
+			if (err) {
 				dev_warn(dev,
 					 "failed to register plugin det irq (%d)\n",
 					 err);
+				lt7911exc->plugin_irq = 0;
+			}
 		}
 	}
 
@@ -2433,6 +2720,7 @@ static int lt7911exc_probe(struct i2c_client *client,
 		v4l2_err(sd, "v4l2 register subdev failed! err:%d\n", err);
 		goto err_clean_entity;
 	}
+	lt7911exc->subdev_registered = true;
 
 	err = v4l2_ctrl_handler_setup(sd->ctrl_handler);
 	if (err) {
@@ -2446,23 +2734,30 @@ static int lt7911exc_probe(struct i2c_client *client,
 			      msecs_to_jiffies(POLL_INTERVAL_MS));
 
 	enable_stream(sd, false);
+	lt7911exc_connect_cc(lt7911exc);
+	err = devm_device_add_group(dev, &lt7911exc_fw_attr_group);
+	if (err) {
+		lt7911exc_link_off(lt7911exc);
+		goto err_clean_entity;
+	}
 	v4l2_info(sd, "%s found @ 0x%x (%s)\n", client->name,
 			client->addr << 1, client->adapter->name);
 
 	return 0;
 
 err_clean_entity:
+	lt7911exc_fw_pause_runtime(lt7911exc);
+	if (lt7911exc->subdev_registered)
+		v4l2_async_unregister_subdev(sd);
 #if defined(CONFIG_MEDIA_CONTROLLER)
 	media_entity_cleanup(&sd->entity);
 #endif
 err_free_hdl:
+	lt7911exc_fw_pause_runtime(lt7911exc);
 	v4l2_ctrl_handler_free(&lt7911exc->hdl);
 	mutex_destroy(&lt7911exc->confctl_mutex);
 err_work_queues:
-	if (!lt7911exc->i2c_client->irq)
-		flush_work(&lt7911exc->work_i2c_poll);
-	cancel_delayed_work_sync(&lt7911exc->delayed_work_hotplug);
-	cancel_delayed_work_sync(&lt7911exc->delayed_work_res_change);
+	lt7911exc_fw_pause_runtime(lt7911exc);
 
 	return err;
 }
@@ -2472,7 +2767,13 @@ static void lt7911exc_remove(struct i2c_client *client)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct lt7911exc *lt7911exc = to_lt7911exc(sd);
 
+	devm_device_remove_group(&client->dev, &lt7911exc_fw_attr_group);
+	mutex_lock(&lt7911exc->fw_lock);
+	lt7911exc->removing = true;
+	lt7911exc_link_off(lt7911exc);
+	mutex_unlock(&lt7911exc->fw_lock);
 	if (!lt7911exc->runtime_registered) {
+		__lt7911exc_power_off(lt7911exc);
 		if (lt7911exc->xvclk)
 			clk_disable_unprepare(lt7911exc->xvclk);
 		mutex_destroy(&lt7911exc->fw_lock);
@@ -2487,6 +2788,7 @@ static void lt7911exc_remove(struct i2c_client *client)
 	}
 	cancel_delayed_work_sync(&lt7911exc->delayed_work_hotplug);
 	cancel_delayed_work_sync(&lt7911exc->delayed_work_res_change);
+	__lt7911exc_power_off(lt7911exc);
 	v4l2_async_unregister_subdev(sd);
 	v4l2_device_unregister_subdev(sd);
 #if defined(CONFIG_MEDIA_CONTROLLER)
@@ -2507,6 +2809,16 @@ static const struct of_device_id lt7911exc_of_match[] = {
 MODULE_DEVICE_TABLE(of, lt7911exc_of_match);
 #endif
 
+static void lt7911exc_shutdown(struct i2c_client *client)
+{
+	struct lt7911exc *lt = to_lt7911exc(i2c_get_clientdata(client));
+
+	mutex_lock(&lt->fw_lock);
+	lt->system_suspended = true;
+	lt7911exc_link_off(lt);
+	mutex_unlock(&lt->fw_lock);
+}
+
 static struct i2c_driver lt7911exc_driver = {
 	.driver = {
 		.name = LT7911EXC_NAME,
@@ -2515,6 +2827,7 @@ static struct i2c_driver lt7911exc_driver = {
 	},
 	.probe = lt7911exc_probe,
 	.remove = lt7911exc_remove,
+	.shutdown = lt7911exc_shutdown,
 };
 
 static int __init lt7911exc_driver_init(void)

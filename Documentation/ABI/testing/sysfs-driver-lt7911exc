@@ -1,0 +1,36 @@
+What:           /sys/bus/i2c/devices/.../link_enable
+Date:           September 2026
+Description:
+                LT7911EXC board link control (root writable). Write 1 to enable
+                supplies, check chip communication, then connect CC. Write 0 to
+                quiesce IRQ/work, isolate CC, then remove supplies. Read returns
+                1 only after initialization succeeds; 0 means not ready/off.
+                No video source is required for initialization to succeed.
+                Active capture, firmware update or another transition returns
+                EBUSY. Missing power/CC GPIOs returns EOPNOTSUPP. A userspace
+                disable survives system suspend/resume, not a cold reboot.
+                Runtime register access/stream start returns EHOSTDOWN while
+                disabled. No GPIO reset pulse is issued on boards specifying
+                lontium,no-reset-on-power-on; reset is released open drain.
+
+What:           /sys/bus/i2c/devices/.../link_status
+Date:           September 2026
+Description:
+                Read-only cached powered/ready/streaming/updating/suspended
+                flags. Reading this snapshot never performs I2C transfers.
+                Concurrent transitions may update the individual fields.
+
+What:           /sys/bus/i2c/devices/.../registers
+Date:           September 2026
+Description:
+                Read-only driver-serialized chip ID and video status snapshot.
+                Does not access flash. Disabled link returns EHOSTDOWN; an
+                exclusive operation already in progress returns EBUSY.
+                Use this interface instead of forced i2c-dev register access.
+
+What:           /sys/bus/i2c/devices/.../firmware_update
+Date:           September 2026
+Description:
+                Existing root-only updater: write update or force. No automatic
+                flashing is performed. Requires supplies on; rejects active
+                capture. The power control lock is held throughout the update.
