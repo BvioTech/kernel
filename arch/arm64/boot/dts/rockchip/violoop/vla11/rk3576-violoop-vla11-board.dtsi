@@ -35,10 +35,24 @@
 		/* Keep the legacy ALSA card ID expected by Violoop userspace. */
 		rockchip,card-name = "rockchip-es8388";
         hp-det-gpio = <&gpio4 RK_PB0 GPIO_ACTIVE_LOW>;
-        io-channels = <&saradc 3>;
-        io-channel-names = "adc-detect";
-        keyup-threshold-microvolt = <1800000>;
-        poll-interval = <100>;
+	/*
+	 * SARADC VIN3 is reserved for the 12-bit board HWID resistor ladder.
+	 * Keep this channel unclaimed so userspace can read in_voltage3_raw
+	 * through the standard IIO ABI.  Only HW_ID0 is currently assigned;
+	 * all remaining codes are reserved for future board revisions.
+	 *
+	 *   HW_ID0     0   assigned
+	 *   HW_ID1   416   reserved
+	 *   HW_ID2   816   reserved
+	 *   HW_ID3  1231   reserved
+	 *   HW_ID4  1658   reserved
+	 *   HW_ID5  2048   reserved
+	 *   HW_ID6  2437   reserved
+	 *   HW_ID7  2862   reserved
+	 *   HW_ID8  3279   reserved
+	 *   HW_ID9  3680   reserved
+	 *   HW_ID10 4095   reserved
+	 */
         spk-con-gpio = <&gpio2 RK_PD0 GPIO_ACTIVE_HIGH>;
         //hp-con-gpio = <&gpio3 RK_PD6 GPIO_ACTIVE_HIGH>;
 		/* Keep the PA muted until the codec output is stable. */
@@ -56,11 +70,6 @@
             "INPUT2", "Headset Mic";
         pinctrl-names = "default";
         pinctrl-0 = <&hp_det>;
-        play-pause-key {
-            label = "playpause";
-            linux,code = <KEY_PLAYPAUSE>;
-            press-threshold-microvolt = <2000>;
-        };
     };
 
 
