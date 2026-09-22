@@ -16,6 +16,14 @@
 		reg = <0>;
 		status = "okay";
 
+		/*
+		 * This module requires LP initialization to complete before the
+		 * host applies its final continuous HS clock policy. Keep this
+		 * opt-in on the FPT/CH13726A panel only; other panels retain the
+		 * default Rockchip DSI sequence.
+		 */
+		rockchip,keep-init-clock-non-continuous;
+
 		prepare-delay-ms = <15>;
 		reset-delay-ms = <10>;
 		init-delay-ms = <10>;
