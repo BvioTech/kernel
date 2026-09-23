@@ -296,6 +296,13 @@ struct dw_mipi_dsi2 {
 
 	bool support_psr;
 	bool enabled;
+	/*
+	 * Some panels require the DSI clock lane to remain in the PHY's
+	 * pre-enable/non-continuous state while their LP initialization
+	 * commands are sent. This is an explicit per-panel opt-in so the
+	 * default Rockchip sequence remains unchanged for every other panel.
+	 */
+	bool keep_init_clock_non_continuous;
 };
 
 static inline struct dw_mipi_dsi2 *host_to_dsi2(struct mipi_dsi_host *host)
@@ -1719,6 +1726,13 @@ static int dw_mipi_dsi2_host_attach(struct mipi_dsi_host *host,
 	dsi2->channel = device->channel;
 	dsi2->format = device->format;
 	dsi2->mode_flags = device->mode_flags;
+	dsi2->keep_init_clock_non_continuous =
+		of_property_read_bool(device->dev.of_node,
+				      "rockchip,keep-init-clock-non-continuous");
+	dev_info(dsi2->dev, "panel init clock policy: %s\n",
+		 dsi2->keep_init_clock_non_continuous ?
+		 "defer continuous clock until enable" :
+		 "default Rockchip sequence");
 
 	ret = dw_mipi_dsi2_dual_channel_probe(dsi2);
 	if (ret)
@@ -1805,7 +1819,14 @@ static ssize_t dw_mipi_dsi2_transfer(struct dw_mipi_dsi2 *dsi2,
 	u32 mode;
 
 	pm_runtime_get_sync(dsi2->dev);
-	dw_mipi_dsi2_clk_management(dsi2);
+	/*
+	 * Preserve the original Rockchip behaviour unless the attached panel
+	 * explicitly asks to keep the pre-enable/non-continuous clock policy
+	 * throughout its LP initialization sequence. dw_mipi_dsi2_enable()
+	 * always applies the final clock policy before video starts.
+	 */
+	if (!dsi2->keep_init_clock_non_continuous || dsi2->enabled)
+		dw_mipi_dsi2_clk_management(dsi2);
 	regmap_update_bits(dsi2->regmap, DSI2_DSI_VID_TX_CFG, LPDT_DISPLAY_CMD_EN,
 			   msg->flags & MIPI_DSI_MSG_USE_LPM ? LPDT_DISPLAY_CMD_EN : 0);
 
