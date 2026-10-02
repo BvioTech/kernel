@@ -29,6 +29,25 @@
 		};
 	};
 
+	/*
+	 * VLA11 recovery key resistor ladder on SARADC1.  Expose it as a generic
+	 * programmable key: pressing it must not invoke a Linux system action.
+	 */
+	recovery_keys: recovery-keys {
+		compatible = "adc-keys";
+		io-channels = <&saradc 1>;
+		io-channel-names = "buttons";
+		keyup-threshold-microvolt = <1800000>;
+		poll-interval = <100>;
+		status = "okay";
+
+		recovery-key {
+			label = "recovery";
+			linux,code = <KEY_PROG2>;
+			press-threshold-microvolt = <1750>;
+		};
+	};
+
 	es8389_sound: es8389-sound {
         status = "okay";
         compatible = "rockchip,multicodecs-card";
