@@ -514,6 +514,19 @@ config VCPU_STALL_DETECTOR
 
 	  If you do not intend to run this kernel as a guest, say N.
 
+config VIOLOOP_FACTORY_OTP_READ
+	bool "Violoop factory OTP read-only state"
+	depends on ARCH_ROCKCHIP && TEE=y && OPTEE=y
+	help
+	  Expose the two fixed factory state bits without any write operation.
+
+config VIOLOOP_FACTORY_OTP_WRITE
+	tristate "Violoop factory-layer OTP writer"
+	depends on VIOLOOP_FACTORY_OTP_READ && m
+	help
+	  Factory-only module for irreversible bit0 completion and bit1 testing.
+	  Keep this module in the removable test layer, never the product rootfs.
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"

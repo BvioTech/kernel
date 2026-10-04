@@ -1,0 +1,44 @@
+What:           /sys/kernel/violoop_factory_otp/status
+Date:           October 2026
+Contact:        Violoop platform maintainers
+Description:
+                Read-only OEM non-protected zone byte 0 bit 0 (0 or 1).
+                A read failure is an error, never an implicit zero. This is
+                not the Secure Boot enable bit or the public-key-hash area.
+
+What:           /sys/kernel/violoop_factory_otp/test_status
+Date:           October 2026
+Contact:        Violoop platform maintainers
+Description:    Read-only byte 0 bit 1, reserved for one irreversible test.
+
+What:           /sys/kernel/violoop_factory_otp_write/commit
+What:           /sys/kernel/violoop_factory_otp_write/test_commit
+Date:           October 2026
+Contact:        Violoop platform maintainers
+Description:
+                Factory-owned loadable module only. Requires CAP_SYS_RAWIO.
+                commit accepts COMMIT_FACTORY_DONE_V1 to set only bit 0.
+                test_commit accepts COMMIT_FACTORY_TEST_BIT1_V1 to set only
+                bit 1. Both read-modify-write the aligned first OEM word and
+                verify readback. No address, length, value or mask is accepted.
+                Setting bit 0 permanently closes this module's write path.
+                All other OEM bits are preserved. No automatic retry occurs.
+
+What:           /sys/kernel/violoop_factory_otp_write/enabled
+Date:           October 2026
+Contact:        Violoop platform maintainers
+Description:
+                Root-only temporary software write gate, 0 or 1. It cannot
+                clear a programmed bit, nor reopen writes after bit 0 is one.
+                Read-only state remains available when this gate is closed.
+
+What:           /sys/kernel/violoop_factory_otp_write/api
+Date:           October 2026
+Contact:        Violoop platform maintainers
+Description:
+                Performs a TEE read and reports gate/entry availability. It
+                never burns any bit. burn_test=not_performed distinguishes
+                API availability from a physically verified programming test.
+                This module restricts the interface it provides; it does not
+                install a hardware ACL for the other OEM bits, and does not
+                claim to disable independently available vendor TEE interfaces.
