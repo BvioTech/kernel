@@ -4580,14 +4580,20 @@ static void vop2_initial(struct drm_crtc *crtc)
 		vop2->is_enabled = true;
 	}
 
-	vop2_debug_irq_enable(crtc);
+	ret = clk_prepare_enable(vp->dclk);
+	if (ret < 0) {
+		DRM_DEV_ERROR(vop2->dev, "failed to enable dclk for video port%d - %d\n",
+			      vp->id, ret);
+		return;
+	}
 
 	vop2->enable_count++;
 
-	ret = clk_prepare_enable(vp->dclk);
-	if (ret < 0)
-		DRM_DEV_ERROR(vop2->dev, "failed to enable dclk for video port%d - %d\n",
-			      vp->id, ret);
+	/*
+	 * Enable POST_BUF_EMPTY only after dclk is running. Otherwise a pending
+	 * interrupt during loader-logo handoff can prevent VP initialization.
+	 */
+	vop2_debug_irq_enable(crtc);
 }
 
 /*
