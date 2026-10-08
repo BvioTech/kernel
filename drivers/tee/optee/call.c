@@ -13,6 +13,48 @@
 
 #define MAX_ARG_PARAM_COUNT	6
 
+#ifdef CONFIG_VIOLOOP_OEM_OTP_WRITE_GUARD
+static DEFINE_MUTEX(violoop_oem_write_lock);
+static const uuid_t violoop_oem_uuid =
+	UUID_INIT(0x2d26d8a8, 0x5134, 0x4dd8,
+		  0xb3, 0x2f, 0xb3, 0x4b, 0xce, 0xeb, 0xc4, 0x71);
+
+static int violoop_oem_write_check(struct tee_context *ctx, u32 session)
+{
+	struct tee_ioctl_invoke_arg arg = { .func = 13, .session = session,
+		.num_params = 4 };
+	struct tee_param param[4] = {};
+	struct tee_shm *shm;
+	__le32 *word;
+	int rc;
+
+	shm = tee_shm_alloc_kernel_buf(ctx, sizeof(*word));
+	if (IS_ERR(shm))
+		return PTR_ERR(shm);
+	word = tee_shm_get_va(shm, 0);
+	if (IS_ERR(word)) {
+		rc = PTR_ERR(word);
+		goto out;
+	}
+	*word = 0;
+	param[0].attr = TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INPUT;
+	param[0].u.value.a = 0;
+	param[1].attr = TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_OUTPUT;
+	param[1].u.memref.shm = shm;
+	param[1].u.memref.size = sizeof(*word);
+	/* Use the same OEM session, without re-entering the NVMEM mutex. */
+	rc = optee_invoke_func(ctx, &arg, param);
+	if (!rc && (arg.ret || param[1].u.memref.size != sizeof(*word)))
+		rc = -EIO;
+	if (!rc && (le32_to_cpu(*word) & 1))
+		rc = -EPERM;
+	memzero_explicit(word, sizeof(*word));
+out:
+	tee_shm_free(shm);
+	return rc;
+}
+#endif
+
 /*
  * How much memory we allocate for each entry. This doesn't have to be a
  * single page, but it makes sense to keep at least keep it as multiples of
@@ -336,6 +378,10 @@ int optee_open_session(struct tee_context *ctx,
 	if (msg_arg->ret == TEEC_SUCCESS) {
 		/* A new session has been created, add it to the list. */
 		sess->session_id = msg_arg->session;
+#ifdef CONFIG_VIOLOOP_OEM_OTP_WRITE_GUARD
+		sess->violoop_oem_otp = !memcmp(arg->uuid, violoop_oem_uuid.b,
+					      TEE_IOCTL_UUID_LEN);
+#endif
 		mutex_lock(&ctxdata->mutex);
 		list_add(&sess->list_node, &ctxdata->sess_list);
 		mutex_unlock(&ctxdata->mutex);
@@ -410,10 +456,16 @@ int optee_invoke_func(struct tee_context *ctx, struct tee_ioctl_invoke_arg *arg,
 	struct tee_shm *shm;
 	u_int offs;
 	int rc;
+#ifdef CONFIG_VIOLOOP_OEM_OTP_WRITE_GUARD
+	bool guard_write, guard_locked = false;
+#endif
 
 	/* Check that the session is valid */
 	mutex_lock(&ctxdata->mutex);
 	sess = find_session(ctxdata, arg->session);
+#ifdef CONFIG_VIOLOOP_OEM_OTP_WRITE_GUARD
+	guard_write = sess && sess->violoop_oem_otp && arg->func == 12;
+#endif
 	mutex_unlock(&ctxdata->mutex);
 	if (!sess)
 		return -EINVAL;
@@ -432,6 +484,17 @@ int optee_invoke_func(struct tee_context *ctx, struct tee_ioctl_invoke_arg *arg,
 	if (rc)
 		goto out;
 
+#ifdef CONFIG_VIOLOOP_OEM_OTP_WRITE_GUARD
+	if (guard_write) {
+		/* Keep the check and OEM write serialized, including bit0 sealing. */
+		mutex_lock(&violoop_oem_write_lock);
+		guard_locked = true;
+		rc = violoop_oem_write_check(ctx, arg->session);
+		if (rc)
+			goto out;
+	}
+#endif
+
 	if (optee->ops->do_call_with_arg(ctx, shm, offs)) {
 		msg_arg->ret = TEEC_ERROR_COMMUNICATION;
 		msg_arg->ret_origin = TEEC_ORIGIN_COMMS;
@@ -447,6 +510,10 @@ int optee_invoke_func(struct tee_context *ctx, struct tee_ioctl_invoke_arg *arg,
 	arg->ret_origin = msg_arg->ret_origin;
 out:
 	optee_free_msg_arg(ctx, entry, offs);
+#ifdef CONFIG_VIOLOOP_OEM_OTP_WRITE_GUARD
+	if (guard_locked)
+		mutex_unlock(&violoop_oem_write_lock);
+#endif
 	return rc;
 }
 

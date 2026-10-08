@@ -181,6 +181,9 @@ struct optee {
 struct optee_session {
 	struct list_head list_node;
 	u32 session_id;
+#ifdef CONFIG_VIOLOOP_OEM_OTP_WRITE_GUARD
+	bool violoop_oem_otp;
+#endif
 };
 
 struct optee_context_data {

@@ -1,0 +1,55 @@
+What:           /sys/kernel/violoop_factory_otp/status
+Date:           October 2026
+Contact:        Violoop platform maintainers
+Description:
+                Read-only OEM non-protected zone byte 0 bit 0 (0 or 1).
+                A read failure is an error, never an implicit zero. This is
+                not the Secure Boot enable bit or the public-key-hash area.
+
+What:           /sys/kernel/violoop_factory_otp/test_status
+Date:           October 2026
+Contact:        Violoop platform maintainers
+Description:    Read-only byte 0 bit 1, reserved for one irreversible test.
+
+What:           /sys/kernel/violoop_factory_otp_write/commit
+What:           /sys/kernel/violoop_factory_otp_write/test_commit
+Date:           October 2026
+Contact:        Violoop platform maintainers
+Description:
+                Factory-owned loadable module only. Requires CAP_SYS_RAWIO.
+                commit accepts COMMIT_FACTORY_DONE_V1 to set only bit 0.
+                test_commit accepts COMMIT_FACTORY_TEST_BIT1_V1 to set only
+                bit 1. Both read-modify-write the aligned first OEM word and
+                verify readback. No address, length, value or mask is accepted.
+                Setting bit 0 closes OEM writes through the guarded OP-TEE
+                command path, including the standard NVMEM write interface.
+                All other OEM bits are preserved. No automatic retry occurs.
+
+What:           /sys/kernel/violoop_factory_otp_write/enabled
+Date:           October 2026
+Contact:        Violoop platform maintainers
+Description:
+                Root-only temporary software write gate, 0 or 1. It cannot
+                clear a programmed bit, nor reopen writes after bit 0 is one.
+                Read-only state remains available when this gate is closed.
+
+What:           /sys/kernel/violoop_factory_otp_write/api
+Date:           October 2026
+Contact:        Violoop platform maintainers
+Description:
+                Performs a TEE read and reports gate/entry availability. It
+                never burns any bit. burn_test=not_performed distinguishes
+                API availability from a physically verified programming test.
+                The VLA11 OP-TEE write guard rejects OEM command 12 when
+                bit 0 is set or its read fails. Command 13 remains readable.
+                This is a kernel policy, not a physical OTP hardware lock.
+
+What:           /sys/bus/nvmem/devices/rockchip-secure-otp0/nvmem
+Date:           October 2026
+Contact:        Violoop platform maintainers
+Description:
+                Standard Rockchip non-protected OEM NVMEM interface, 32 bytes
+                with 4-byte alignment. Reads remain available after bit 0.
+                The authorization block is offset 0x10, length 16: two zero
+                bytes followed by 14 raw ASCII authorization bytes. OEM bit 0
+                is the factory completion flag, not a Secure Boot fuse.

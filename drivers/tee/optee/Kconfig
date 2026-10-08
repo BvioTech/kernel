@@ -7,3 +7,10 @@ config OPTEE
 	help
 	  This implements the OP-TEE Trusted Execution Environment (TEE)
 	  driver.
+
+config VIOLOOP_OEM_OTP_WRITE_GUARD
+	bool "Violoop OEM OTP factory completion write guard"
+	depends on ARCH_ROCKCHIP && OPTEE=y
+	help
+	  Reject Rockchip OEM OTP writes after OEM byte 0 bit 0 is set.
+	  Read failures also reject writes. OEM reads remain available.
