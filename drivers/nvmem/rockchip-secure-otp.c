@@ -98,8 +98,7 @@ int rockchip_read_oem_non_protected_otp(unsigned int byte_off,
 
 	/* Alloc share memory */
 	shm_size = byte_len;
-	device_shm = tee_shm_alloc(ctx, shm_size,
-				   TEE_SHM_MAPPED | TEE_SHM_DMA_BUF);
+	device_shm = tee_shm_alloc_kernel_buf(ctx, shm_size);
 	if (IS_ERR(device_shm)) {
 		pr_err("tee_shm_alloc failed\n");
 		rc = PTR_ERR(device_shm);
@@ -124,7 +123,8 @@ int rockchip_read_oem_non_protected_otp(unsigned int byte_off,
 	param[1].u.memref.shm_offs = 0;
 
 	rc = tee_client_invoke_func(ctx, &inv_arg, param);
-	if ((rc < 0) || (inv_arg.ret != 0)) {
+	if ((rc < 0) || (inv_arg.ret != 0) ||
+	    param[1].u.memref.size != byte_len) {
 		pr_err("invoke function err: %x\n", inv_arg.ret);
 		rc = -EINVAL;
 		goto out_shm;
@@ -201,8 +201,7 @@ int rockchip_write_oem_non_protected_otp(unsigned int byte_off,
 
 	/* Alloc share memory */
 	shm_size = byte_len;
-	device_shm = tee_shm_alloc(ctx, shm_size,
-				   TEE_SHM_MAPPED | TEE_SHM_DMA_BUF);
+	device_shm = tee_shm_alloc_kernel_buf(ctx, shm_size);
 	if (IS_ERR(device_shm)) {
 		pr_err("tee_shm_alloc failed\n");
 		rc = PTR_ERR(device_shm);

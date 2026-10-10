@@ -16,4 +16,9 @@
 / {
 	model = "Violoop RK3576 VLA11 Minimal Debian";
 	compatible = "violoop,rk3576-vla11", "rockchip,rk3576";
+
+	secure_otp: secure-otp {
+		compatible = "rockchip,secure-otp";
+		rockchip,otp-size = <32>;
+	};
 };

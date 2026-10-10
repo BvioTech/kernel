@@ -22,6 +22,16 @@ config VIDEO_RK628_CSI
 	  To compile this driver as a module, choose M here: the
 	  module will be called rk628-csi.
 
+config VIDEO_RK628_VLA11_EDID_4K30
+	bool "VLA11 RK628 single-MIPI 4K30 preferred EDID"
+	depends on VIDEO_RK628_CSI
+	default n
+	help
+	  Prefer 3840x2160p30 in the single-MIPI HDMI EDID for VLA11.
+	  Enable this only in the VLA11 kernel configuration. Other boards
+	  retain the original single-MIPI EDID when this is disabled.
+	  The dual-MIPI EDID is unchanged.
+
 config VIDEO_RK628_BT1120
 	tristate "Rockchip RK628_BT1120 decoder"
 	depends on VIDEO_DEV && I2C
