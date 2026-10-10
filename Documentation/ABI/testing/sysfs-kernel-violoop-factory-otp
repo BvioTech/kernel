@@ -25,6 +25,15 @@ Description:
                 command path, including the standard NVMEM write interface.
                 All other OEM bits are preserved. No automatic retry occurs.
 
+                Before bit 0 is set, this module assumes it is the sole
+                writer of the first OEM word (offset 0). Its read-modify-write
+                is serialized only against its own concurrent callers; it is
+                not serialized against a separate process writing the same
+                word through the standard NVMEM interface. Provisioning
+                tooling must guarantee a single writer to that word during
+                this window; concurrent writers from two different paths can
+                interleave and corrupt the committed bits.
+
 What:           /sys/kernel/violoop_factory_otp_write/enabled
 Date:           October 2026
 Contact:        Violoop platform maintainers

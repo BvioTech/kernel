@@ -24,7 +24,15 @@ static int flags_read(u32 *value)
 	return ret;
 }
 
-/* No offset/mask/data argument is accepted from userspace. Preserve all other bits. */
+/*
+ * No offset/mask/data argument is accepted from userspace. Preserve all other bits.
+ *
+ * write_lock only serializes this module's own callers. Before bit0 is set, the
+ * read-modify-write below assumes exclusive ownership of OEM word 0: a concurrent
+ * write to the same word through the standard NVMEM interface is not excluded and
+ * can interleave with it. Provisioning flows must guarantee a single writer to
+ * this word during that window.
+ */
 static int commit_flag(unsigned int bit)
 {
 	u32 before, after, desired;
