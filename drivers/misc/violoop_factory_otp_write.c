@@ -41,7 +41,7 @@ static int commit_flag(unsigned int bit)
 		goto out;
 	if (before & BIT(0)) {
 		enabled = false;
-		ret = bit == 0 ? 0 : -EPERM;
+		ret = -EPERM;
 		goto out;
 	}
 	if (!enabled) {
@@ -91,7 +91,12 @@ static ssize_t test_commit_store(struct kobject *k, struct kobj_attribute *a,
 }
 static ssize_t enabled_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
-	return sysfs_emit(buf, "%u\n", READ_ONCE(enabled));
+	bool value;
+
+	mutex_lock(&write_lock);
+	value = enabled;
+	mutex_unlock(&write_lock);
+	return sysfs_emit(buf, "%u\n", value);
 }
 static ssize_t enabled_store(struct kobject *k, struct kobj_attribute *a,
 			    const char *buf, size_t count)
@@ -122,6 +127,7 @@ static ssize_t enabled_store(struct kobject *k, struct kobj_attribute *a,
 static ssize_t api_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
 	u32 value;
+	bool is_enabled;
 	int ret;
 	if (!capable(CAP_SYS_RAWIO))
 		return -EPERM;
@@ -129,11 +135,12 @@ static ssize_t api_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 	ret = flags_read(&value);
 	if (!ret && (value & BIT(0)))
 		enabled = false;
+	is_enabled = enabled;
 	mutex_unlock(&write_lock);
 	if (ret)
 		return ret;
 	return sysfs_emit(buf, "version=1 read_api=ok write_entry=present enabled=%u bit0=%u bit1=%u burn_test=not_performed\n",
-		READ_ONCE(enabled), !!(value & BIT(0)), !!(value & BIT(1)));
+		is_enabled, !!(value & BIT(0)), !!(value & BIT(1)));
 }
 static struct kobj_attribute commit_attr = __ATTR(commit, 0200, NULL, commit_store);
 static struct kobj_attribute test_attr = __ATTR(test_commit, 0200, NULL, test_commit_store);
@@ -159,8 +166,10 @@ static int __init writer_init(void)
 		return -ENOMEM;
 	enabled = true;
 	ret = sysfs_create_group(write_kobj, &group);
-	if (ret)
+	if (ret) {
 		kobject_put(write_kobj);
+		write_kobj = NULL;
+	}
 	return ret;
 }
 static void __exit writer_exit(void)
