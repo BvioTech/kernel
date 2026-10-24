@@ -405,6 +405,28 @@ int mipi_dsi_detach(struct mipi_dsi_device *dsi)
 }
 EXPORT_SYMBOL(mipi_dsi_detach);
 
+/**
+ * mipi_dsi_host_request_esd_recovery - rebuild a damaged DSI pipeline
+ * @dsi: DSI peripheral whose host should be recovered
+ *
+ * The operation is optional and asynchronous.  Hosts implementing it must
+ * serialize recovery with their normal atomic modeset path.
+ */
+int mipi_dsi_host_request_esd_recovery(struct mipi_dsi_device *dsi)
+{
+	const struct mipi_dsi_host_ops *ops;
+
+	if (!dsi || !dsi->host)
+		return -EINVAL;
+
+	ops = dsi->host->ops;
+	if (!ops || !ops->request_esd_recovery)
+		return -EOPNOTSUPP;
+
+	return ops->request_esd_recovery(dsi->host, dsi);
+}
+EXPORT_SYMBOL(mipi_dsi_host_request_esd_recovery);
+
 static void devm_mipi_dsi_detach(void *arg)
 {
 	struct mipi_dsi_device *dsi = arg;
