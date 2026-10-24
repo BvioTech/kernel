@@ -42,6 +42,9 @@
 		rockchip,dcs-backlight-byte;
 		rockchip,dcs-backlight-max = <255>;
 		rockchip,dcs-display-control;
+		violoop,dcs-brightness-cache-only;
+		violoop,esd-status-check;
+		violoop,esd-auto-recover;
 
 		/* Supplier short code: 35 00; 11 + 120 ms; 29 + 40 ms. */
 		panel-init-sequence = [

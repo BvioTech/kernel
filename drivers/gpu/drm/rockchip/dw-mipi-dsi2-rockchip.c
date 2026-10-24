@@ -7,16 +7,21 @@
 
 #include <linux/clk.h>
 #include <linux/component.h>
+#include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/gpio.h>
 #include <linux/iopoll.h>
+#include <linux/jiffies.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of_device.h>
 #include <linux/of_gpio.h>
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/string.h>
+#include <linux/workqueue.h>
 #include <linux/mfd/syscon.h>
 #include <linux/phy/phy.h>
 
@@ -24,6 +29,7 @@
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_mipi_dsi.h>
+#include <drm/drm_modeset_helper.h>
 #include <drm/drm_of.h>
 #include <drm/drm_panel.h>
 #include <video/mipi_display.h>
@@ -34,6 +40,7 @@
 #include <drm/drm_connector.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
+#include <drm/drm_vblank.h>
 
 #include "rockchip_drm_drv.h"
 #include "rockchip_drm_vop.h"
@@ -184,6 +191,11 @@ panel_jujing_jn3929595a_loader_protect(struct drm_panel *panel)
 
 #define MODE_STATUS_TIMEOUT_US		10000
 #define CMD_PKT_STATUS_TIMEOUT_US	20000
+#define READ_PKT_STATUS_TIMEOUT_US	50000
+#define DSI2_ESD_FAULT_POLL_MS		20
+#define DSI2_ESD_VBLANK_CHECK_MS		1500
+#define DSI2_ESD_VBLANK_STALL_LIMIT	2
+#define DSI2_ESD_VBLANK_VERIFY_MS	80
 #define PSEC_PER_SEC			1000000000000LL
 
 #define GRF_REG_FIELD(reg, lsb, msb)	(((reg) << 16) | ((lsb) << 8) | (msb))
@@ -303,6 +315,28 @@ struct dw_mipi_dsi2 {
 	 * default Rockchip sequence remains unchanged for every other panel.
 	 */
 	bool keep_init_clock_non_continuous;
+	bool esd_recovery_enabled;
+	bool esd_monitor_running;
+	bool esd_removing;
+	unsigned long last_esd_modeset_request;
+	struct mutex transfer_lock;
+	unsigned long last_host_recovery;
+	u32 host_recovery_count;
+	u16 active_ipi_pkt;
+	struct work_struct esd_modeset_work;
+	struct delayed_work esd_fault_poll_work;
+	atomic_t esd_modeset_pending;
+	atomic_t esd_lifecycle_generation;
+	u32 esd_modeset_generation;
+	u32 consecutive_read_timeouts;
+	unsigned long last_irq_esd_request;
+	atomic_t irq_fault_count;
+	u32 last_irq_fault;
+	struct drm_crtc *vblank_watch_crtc;
+	u64 last_vblank_count;
+	unsigned long last_vblank_check;
+	u8 vblank_stall_checks;
+	bool vblank_watch_held;
 };
 
 static inline struct dw_mipi_dsi2 *host_to_dsi2(struct mipi_dsi_host *host)
@@ -357,7 +391,9 @@ static int cri_fifos_wait_avail(struct dw_mipi_dsi2 *dsi2)
 				       !(sts & mask), 0,
 				       CMD_PKT_STATUS_TIMEOUT_US);
 	if (ret < 0) {
-		DRM_DEV_ERROR(dsi2->dev, "command interface is busy\n");
+		DRM_DEV_ERROR(dsi2->dev,
+			      "command interface is busy: status=0x%08x\n",
+			      sts);
 		return ret;
 	}
 
@@ -510,6 +546,18 @@ static struct drm_crtc *dw_mipi_dsi2_get_new_crtc(struct dw_mipi_dsi2 *dsi2,
 	return conn_state->crtc;
 }
 
+static void dw_mipi_dsi2_stop_vblank_watch(struct dw_mipi_dsi2 *dsi2)
+{
+	if (dsi2->vblank_watch_held && dsi2->vblank_watch_crtc)
+		drm_crtc_vblank_put(dsi2->vblank_watch_crtc);
+
+	dsi2->vblank_watch_held = false;
+	dsi2->vblank_watch_crtc = NULL;
+	dsi2->last_vblank_count = 0;
+	dsi2->last_vblank_check = 0;
+	dsi2->vblank_stall_checks = 0;
+}
+
 static void dw_mipi_dsi2_encoder_atomic_disable(struct drm_encoder *encoder,
 						struct drm_atomic_state *old_state)
 {
@@ -524,6 +572,10 @@ static void dw_mipi_dsi2_encoder_atomic_disable(struct drm_encoder *encoder,
 
 	if (new_crtc_state && new_crtc_state->self_refresh_active)
 		dev_dbg(dsi2->dev, "%s:%d: psr entry\n", __func__, __LINE__);
+
+	WRITE_ONCE(dsi2->esd_monitor_running, false);
+	cancel_delayed_work_sync(&dsi2->esd_fault_poll_work);
+	dw_mipi_dsi2_stop_vblank_watch(dsi2);
 
 	if (!new_crtc_state || !new_crtc_state->self_refresh_active) {
 		if (dsi2->panel)
@@ -545,7 +597,9 @@ static void dw_mipi_dsi2_encoder_atomic_disable(struct drm_encoder *encoder,
 
 	dw_mipi_dsi2_post_disable(dsi2);
 
-	dsi2->enabled = false;
+	WRITE_ONCE(dsi2->enabled, false);
+	/* Publish completed disable before invalidating queued recovery work. */
+	atomic_inc_return(&dsi2->esd_lifecycle_generation);
 	if (dsi2->slave)
 		dsi2->slave->enabled = false;
 
@@ -795,6 +849,21 @@ static void dw_mipi_dsi2_ipi_color_coding_cfg(struct dw_mipi_dsi2 *dsi2)
 		grf_field_write(dsi2, IPI_FORMAT, IPI_FORMAT_DSC);
 }
 
+static u16 dw_mipi_dsi2_get_ipi_pkt(struct dw_mipi_dsi2 *dsi2)
+{
+	struct drm_display_mode *mode = &dsi2->mode;
+	u16 val = mode->crtc_hdisplay;
+
+	if (!val)
+		val = mode->hdisplay;
+	if ((dsi2->slave || dsi2->master) && val)
+		val /= 2;
+	if (!val)
+		val = dsi2->active_ipi_pkt;
+
+	return val;
+}
+
 static void dw_mipi_dsi2_ipi_set(struct dw_mipi_dsi2 *dsi2)
 {
 	struct drm_display_mode *mode = &dsi2->mode;
@@ -804,10 +873,12 @@ static void dw_mipi_dsi2_ipi_set(struct dw_mipi_dsi2 *dsi2)
 	u32 vact, vsa, vfp, vbp;
 	u16 val;
 
-	if (dsi2->slave || dsi2->master)
-		val = mode->hdisplay / 2;
-	else
-		val = mode->hdisplay;
+	val = dw_mipi_dsi2_get_ipi_pkt(dsi2);
+	if (!val) {
+		dev_err(dsi2->dev, "refusing to program a zero-length IPI packet\n");
+		return;
+	}
+	dsi2->active_ipi_pkt = val;
 
 	regmap_write(dsi2->regmap, DSI2_IPI_PIX_PKT_CFG, MAX_PIX_PKT(val));
 
@@ -953,6 +1024,339 @@ out:
 		dw_mipi_dsi2_enable(dsi2->slave);
 }
 
+static int dw_mipi_dsi2_recover_host(struct dw_mipi_dsi2 *dsi2)
+{
+	u32 status;
+	int ret;
+
+	if (!dsi2->enabled || !dsi2->esd_recovery_enabled)
+		return -EIO;
+
+	regmap_read(dsi2->regmap, DSI2_CORE_STATUS, &status);
+
+	dev_warn(dsi2->dev,
+		 "aborting stuck DSI BTA: status=0x%08x count=%u\n",
+		 status, dsi2->host_recovery_count + 1);
+
+	/*
+	 * A timed-out panel read leaves CRI_BUSY asserted at 0x00010303 while
+	 * the video IPI and DPHY remain healthy.  Resetting the whole host here
+	 * destroys the loader-handoff video state and turns a frozen frame into
+	 * a black panel.  Abort only the bidirectional transaction by toggling
+	 * BTA_EN; never touch PWR_UP, SOFT_RESET, the DPHY or IPI configuration.
+	 */
+	regmap_update_bits(dsi2->regmap, DSI2_DSI_GENERAL_CFG, BTA_EN, 0);
+	udelay(20);
+	regmap_update_bits(dsi2->regmap, DSI2_DSI_GENERAL_CFG,
+			   BTA_EN, BTA_EN);
+
+	ret = regmap_read_poll_timeout(dsi2->regmap, DSI2_CORE_STATUS,
+				       status,
+				       !(status & CRI_BUSY), 10, 5000);
+
+	dsi2->last_host_recovery = jiffies;
+	dsi2->host_recovery_count++;
+	if (ret)
+		dev_warn(dsi2->dev,
+			 "DSI BTA abort did not clear CRI_BUSY: status=0x%08x count=%u\n",
+			 status, dsi2->host_recovery_count);
+	else
+		dev_info(dsi2->dev,
+			 "DSI BTA abort cleared CRI_BUSY: status=0x%08x count=%u\n",
+			 status, dsi2->host_recovery_count);
+
+	return ret;
+}
+
+static int dw_mipi_dsi2_force_current_modeset(struct dw_mipi_dsi2 *dsi2,
+					   u32 *generation)
+{
+	struct drm_device *drm = dsi2->drm_dev;
+	struct drm_mode_config *mode_config = &drm->mode_config;
+	struct drm_atomic_state *state;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *crtc_state;
+	bool target_found = false;
+	int i, ret;
+
+	drm_modeset_lock_all(drm);
+
+	state = drm_atomic_helper_duplicate_state(drm,
+						 mode_config->acquire_ctx);
+	if (IS_ERR(state)) {
+		ret = PTR_ERR(state);
+		goto unlock;
+	}
+
+	/*
+	 * Keep the userspace framebuffer and connector ownership intact.  Only
+	 * force the currently active DSI CRTC through the normal atomic
+	 * disable/enable path.  The former subsystem suspend/resume sequence is
+	 * unsafe while a compositor is live and can leave VOP marked ACTIVE but
+	 * no longer producing frame interrupts.
+	 */
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		if (crtc != dsi2->encoder.crtc || !crtc_state->active)
+			continue;
+
+		/* A nonblocking userspace commit may still own the hardware. */
+		if (crtc->state->commit &&
+		    !completion_done(&crtc->state->commit->hw_done)) {
+			ret = -EBUSY;
+			goto put_state;
+		}
+		if (*generation !=
+		    atomic_read_acquire(&dsi2->esd_lifecycle_generation)) {
+			ret = -ECANCELED;
+			goto put_state;
+		}
+
+		crtc_state->mode_changed = true;
+		crtc_state->connectors_changed = true;
+		target_found = true;
+		break;
+	}
+
+	if (!target_found) {
+		ret = -ENODEV;
+		goto put_state;
+	}
+
+	state->allow_modeset = true;
+	ret = drm_atomic_helper_commit_duplicated_state(state,
+							 mode_config->acquire_ctx);
+	/* The blocking recovery commit advances its own disable generation. */
+	if (!ret)
+		*generation = atomic_read(&dsi2->esd_lifecycle_generation);
+
+put_state:
+	drm_atomic_state_put(state);
+unlock:
+	drm_modeset_unlock_all(drm);
+	return ret;
+}
+
+static int dw_mipi_dsi2_verify_vblank_progress(struct dw_mipi_dsi2 *dsi2,
+						       u64 *before, u64 *after)
+{
+	struct drm_crtc *crtc = dsi2->encoder.crtc;
+	int ret;
+
+	if (!crtc || !READ_ONCE(dsi2->enabled))
+		return -EHOSTDOWN;
+
+	ret = drm_crtc_vblank_get(crtc);
+	if (ret)
+		return ret;
+
+	*before = drm_crtc_vblank_count(crtc);
+	msleep(DSI2_ESD_VBLANK_VERIFY_MS);
+	*after = drm_crtc_vblank_count(crtc);
+	drm_crtc_vblank_put(crtc);
+
+	return *after != *before ? 0 : -ETIMEDOUT;
+}
+
+static void dw_mipi_dsi2_esd_modeset_work(struct work_struct *work)
+{
+	struct dw_mipi_dsi2 *dsi2 =
+		container_of(work, struct dw_mipi_dsi2, esd_modeset_work);
+	u64 vblank_before = 0, vblank_after = 0;
+	u32 generation = READ_ONCE(dsi2->esd_modeset_generation);
+	unsigned int attempt;
+	int ret = -EIO;
+
+	if (!dsi2->drm_dev || !READ_ONCE(dsi2->enabled)) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	/* Do not interfere with a genuine system suspend transaction. */
+	if (dsi2->drm_dev->mode_config.suspend_state) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	dev_warn(dsi2->dev,
+		 "panel ESD DRM modeset recovery begin after %u consecutive read timeouts\n",
+		 READ_ONCE(dsi2->consecutive_read_timeouts));
+
+	/*
+	 * A recovery is successful only when the VOP frame counter advances.
+	 * Do not trust the software ACTIVE flag or a successful DCS register
+	 * read: both remained healthy in the captured frozen-screen incident.
+	 */
+	for (attempt = 1; attempt <= 2; attempt++) {
+		if (READ_ONCE(dsi2->esd_removing) || !READ_ONCE(dsi2->enabled)) {
+			ret = -ENODEV;
+			break;
+		}
+		ret = dw_mipi_dsi2_force_current_modeset(dsi2, &generation);
+		if (ret) {
+			dev_err(dsi2->dev,
+				"panel ESD atomic modeset attempt %u failed: %d\n",
+				attempt, ret);
+			break;
+		}
+
+		ret = dw_mipi_dsi2_verify_vblank_progress(dsi2,
+							   &vblank_before,
+							   &vblank_after);
+		if (!ret)
+			break;
+
+		dev_warn(dsi2->dev,
+			 "panel ESD atomic modeset attempt %u produced no frames: vblank=%llu->%llu\n",
+			 attempt, vblank_before, vblank_after);
+		msleep(100);
+	}
+
+	if (!ret) {
+		WRITE_ONCE(dsi2->consecutive_read_timeouts, 0);
+		dev_warn(dsi2->dev,
+			 "panel ESD DRM modeset recovery verified: vblank=%llu->%llu\n",
+			 vblank_before, vblank_after);
+	}
+
+out:
+	if (ret)
+		dev_warn(dsi2->dev,
+			 "panel ESD DRM modeset recovery aborted: %d\n", ret);
+	atomic_set(&dsi2->esd_modeset_pending, 0);
+}
+
+static void dw_mipi_dsi2_request_esd_modeset(struct dw_mipi_dsi2 *dsi2)
+{
+	u32 generation = atomic_read_acquire(&dsi2->esd_lifecycle_generation);
+
+	if (!dsi2->esd_recovery_enabled || !READ_ONCE(dsi2->enabled) ||
+	    READ_ONCE(dsi2->esd_removing))
+		return;
+	if (atomic_cmpxchg(&dsi2->esd_modeset_pending, 0, 1))
+		return;
+	if (dsi2->last_esd_modeset_request &&
+	    time_before(jiffies, dsi2->last_esd_modeset_request +
+			msecs_to_jiffies(3000))) {
+		atomic_set(&dsi2->esd_modeset_pending, 0);
+		return;
+	}
+	dsi2->last_esd_modeset_request = jiffies;
+	WRITE_ONCE(dsi2->esd_modeset_generation, generation);
+	schedule_work(&dsi2->esd_modeset_work);
+}
+
+static void dw_mipi_dsi2_check_vblank_liveness(struct dw_mipi_dsi2 *dsi2)
+{
+	struct drm_crtc *crtc = READ_ONCE(dsi2->encoder.crtc);
+	u64 count;
+	int ret;
+
+	if (!crtc || !READ_ONCE(dsi2->enabled) ||
+	    atomic_read(&dsi2->esd_modeset_pending) ||
+	    dsi2->drm_dev->mode_config.suspend_state) {
+		dsi2->vblank_stall_checks = 0;
+		return;
+	}
+
+	if (!dsi2->vblank_watch_held || dsi2->vblank_watch_crtc != crtc) {
+		dw_mipi_dsi2_stop_vblank_watch(dsi2);
+		ret = drm_crtc_vblank_get(crtc);
+		if (ret)
+			return;
+
+		dsi2->vblank_watch_crtc = crtc;
+		dsi2->vblank_watch_held = true;
+		dsi2->last_vblank_count = drm_crtc_vblank_count(crtc);
+		dsi2->last_vblank_check = jiffies;
+		return;
+	}
+
+	if (time_before(jiffies, dsi2->last_vblank_check +
+			msecs_to_jiffies(DSI2_ESD_VBLANK_CHECK_MS)))
+		return;
+
+	count = drm_crtc_vblank_count(crtc);
+	if (count == dsi2->last_vblank_count) {
+		dsi2->vblank_stall_checks++;
+		if (dsi2->vblank_stall_checks >=
+		    DSI2_ESD_VBLANK_STALL_LIMIT) {
+			dev_warn(dsi2->dev,
+				 "VOP frame output stalled for %ums at vblank=%llu; requesting coordinated DRM recovery\n",
+				 DSI2_ESD_VBLANK_CHECK_MS *
+				 DSI2_ESD_VBLANK_STALL_LIMIT,
+				 count);
+			dsi2->vblank_stall_checks = 0;
+			dw_mipi_dsi2_request_esd_modeset(dsi2);
+		}
+	} else {
+		dsi2->vblank_stall_checks = 0;
+	}
+
+	dsi2->last_vblank_count = count;
+	dsi2->last_vblank_check = jiffies;
+}
+
+static void dw_mipi_dsi2_esd_fault_poll_work(struct work_struct *work)
+{
+	struct dw_mipi_dsi2 *dsi2 = container_of(to_delayed_work(work),
+						 struct dw_mipi_dsi2,
+						 esd_fault_poll_work);
+	u32 int_st = 0, fault_count;
+
+	if (!READ_ONCE(dsi2->esd_monitor_running) ||
+	    !READ_ONCE(dsi2->enabled) || READ_ONCE(dsi2->esd_removing))
+		return;
+	/* The modeset worker owns the hardware while rebuilding the pipeline. */
+	if (atomic_read(&dsi2->esd_modeset_pending))
+		goto requeue;
+
+	/*
+	 * An ESD pulse can assert a DSI fault for less than one panel-health
+	 * interval.  Some board revisions do not route that event to the GIC,
+	 * so preserve the controller's sticky summary with a cheap MMIO read.
+	 * This never sends a panel command and never resets a healthy display.
+	 */
+	if (!regmap_read(dsi2->regmap, INT_ST_MAIN, &int_st) && int_st) {
+		WRITE_ONCE(dsi2->last_irq_fault, int_st);
+		fault_count = atomic_inc_return(&dsi2->irq_fault_count);
+		dev_warn_ratelimited(dsi2->dev,
+			"DSI transient fault polled: main=0x%08x count=%u; requesting coordinated DRM recovery\n",
+			int_st, fault_count);
+		dw_mipi_dsi2_request_esd_modeset(dsi2);
+	}
+
+	/*
+	 * DCS status can remain healthy while the RK3576 VOP has stopped
+	 * producing frames.  Compare the DRM vblank counter at a low rate and
+	 * require two consecutive stalls before recovery.  The normal path is
+	 * an in-memory counter read only; it never resets or refreshes the panel.
+	 */
+	dw_mipi_dsi2_check_vblank_liveness(dsi2);
+
+requeue:
+	if (!READ_ONCE(dsi2->esd_monitor_running))
+		return;
+	mod_delayed_work(system_wq, &dsi2->esd_fault_poll_work,
+			 msecs_to_jiffies(DSI2_ESD_FAULT_POLL_MS));
+}
+
+static void dw_mipi_dsi2_note_read_timeout(struct dw_mipi_dsi2 *dsi2)
+{
+	u32 timeouts = READ_ONCE(dsi2->consecutive_read_timeouts) + 1;
+	u32 status = 0;
+
+	if (!dsi2->esd_recovery_enabled)
+		return;
+	WRITE_ONCE(dsi2->consecutive_read_timeouts, timeouts);
+	regmap_read(dsi2->regmap, DSI2_CORE_STATUS, &status);
+	if (timeouts >= 2 || (status & CRI_BUSY)) {
+		dev_warn(dsi2->dev,
+			 "DSI panel read timeout: count=%u status=0x%08x; requesting coordinated DRM modeset recovery\n",
+			 timeouts, status);
+		dw_mipi_dsi2_request_esd_modeset(dsi2);
+	}
+}
+
 static void dw_mipi_dsi2_get_mipi_pixel_clk(struct dw_mipi_dsi2 *dsi2,
 					    struct rockchip_crtc_state *s)
 {
@@ -1062,6 +1466,12 @@ static void dw_mipi_dsi2_encoder_atomic_enable(struct drm_encoder *encoder,
 		rockchip_drm_crtc_standby(encoder->crtc, 0);
 
 	dsi2->enabled = true;
+	if (dsi2->esd_recovery_enabled && !READ_ONCE(dsi2->esd_removing)) {
+		WRITE_ONCE(dsi2->esd_monitor_running, true);
+		mod_delayed_work(system_wq, &dsi2->esd_fault_poll_work,
+				 msecs_to_jiffies(DSI2_ESD_FAULT_POLL_MS));
+	}
+
 	if (dsi2->slave)
 		dsi2->slave->enabled = true;
 
@@ -1158,6 +1568,8 @@ dw_mipi_dsi2_encoder_atomic_check(struct drm_encoder *encoder,
 
 static void dw_mipi_dsi2_loader_protect(struct dw_mipi_dsi2 *dsi2, bool on)
 {
+	u32 ipi_pkt;
+
 	if (dsi2->dcphy)
 		if (!dsi2->c_option)
 			phy_set_mode(dsi2->dcphy, PHY_MODE_MIPI_DPHY);
@@ -1170,7 +1582,28 @@ static void dw_mipi_dsi2_loader_protect(struct dw_mipi_dsi2 *dsi2, bool on)
 			dsi2->dcphy->power_count++;
 
 		dsi2->enabled = true;
+		/*
+		 * With loader display handoff the kernel does not run encoder
+		 * mode_set/enable, so dsi2->mode can legitimately remain empty while
+		 * U-Boot's live IPI configuration continues driving the panel.  Save
+		 * that known-good packet length before an ESD event can clear it.
+		 */
+		regmap_read(dsi2->regmap, DSI2_IPI_PIX_PKT_CFG, &ipi_pkt);
+		if (ipi_pkt & 0xffff) {
+			dsi2->active_ipi_pkt = ipi_pkt & 0xffff;
+			dev_info(dsi2->dev,
+				 "loader handoff IPI packet cached: 0x%04x\n",
+				 dsi2->active_ipi_pkt);
+		}
+		if (dsi2->esd_recovery_enabled && !READ_ONCE(dsi2->esd_removing)) {
+			WRITE_ONCE(dsi2->esd_monitor_running, true);
+			mod_delayed_work(system_wq, &dsi2->esd_fault_poll_work,
+					 msecs_to_jiffies(DSI2_ESD_FAULT_POLL_MS));
+		}
 	} else {
+		WRITE_ONCE(dsi2->esd_monitor_running, false);
+		cancel_delayed_work_sync(&dsi2->esd_fault_poll_work);
+		dw_mipi_dsi2_stop_vblank_watch(dsi2);
 		pm_runtime_put(dsi2->dev);
 		phy_exit(dsi2->dcphy);
 		dsi2->phy_enabled = false;
@@ -1685,17 +2118,53 @@ static const struct dsi2_irq_data dw_mipi_dsi2_irq_data[] = {
 
 static irqreturn_t dw_mipi_dsi2_irq_handler(int irq, void *dev_id)
 {
-
 	struct dw_mipi_dsi2 *dsi2 = dev_id;
-	u32 int_st;
+	u32 irq_st[ARRAY_SIZE(dw_mipi_dsi2_irq_data)] = { 0 };
+	u32 int_st, fault_count;
 	unsigned int i;
 
 	regmap_read(dsi2->regmap, INT_ST_MAIN, &int_st);
 
-	for (i = 0; i < ARRAY_SIZE(dw_mipi_dsi2_irq_data); i++)
-		if (int_st & BIT(i))
+	for (i = 0; i < ARRAY_SIZE(dw_mipi_dsi2_irq_data); i++) {
+		if (int_st & BIT(i)) {
+			regmap_read(dsi2->regmap,
+				    dw_mipi_dsi2_irq_data[i].offeset,
+				    &irq_st[i]);
 			DRM_DEV_DEBUG(dsi2->dev, "%s\n",
 				      dw_mipi_dsi2_irq_data[i].irq_src);
+		}
+	}
+
+	if (int_st)
+		dev_warn_ratelimited(dsi2->dev,
+			"DSI fault IRQ: main=0x%08x phy=0x%08x timeout=0x%08x ack=0x%08x ipi=0x%08x fifo=0x%08x pri=0x%08x cri=0x%08x\n",
+			int_st, irq_st[0], irq_st[1], irq_st[2], irq_st[3],
+			irq_st[4], irq_st[5], irq_st[6]);
+
+	/*
+	 * The panel status watchdog runs every few seconds.  An ESD pulse can
+	 * raise a short-lived DSI controller fault and leave the panel frozen
+	 * even though the later DCS status reads are healthy again.  Preserve
+	 * the hardware fault at interrupt time and run the existing coordinated
+	 * DRM recovery from process context.  Do not poll faster and do not
+	 * recover without an actual DSI fault interrupt.
+	 */
+	if (int_st && dsi2->esd_recovery_enabled &&
+	    READ_ONCE(dsi2->esd_monitor_running)) {
+		WRITE_ONCE(dsi2->last_irq_fault, int_st);
+		fault_count = atomic_inc_return(&dsi2->irq_fault_count);
+
+		if (!READ_ONCE(dsi2->last_irq_esd_request) ||
+		    time_after_eq(jiffies,
+				  READ_ONCE(dsi2->last_irq_esd_request) +
+				  msecs_to_jiffies(3000))) {
+			WRITE_ONCE(dsi2->last_irq_esd_request, jiffies);
+			dev_warn(dsi2->dev,
+				 "DSI transient fault latched: main=0x%08x count=%u; requesting coordinated DRM recovery\n",
+				 int_st, fault_count);
+			dw_mipi_dsi2_request_esd_modeset(dsi2);
+		}
+	}
 
 	return IRQ_HANDLED;
 }
@@ -1733,6 +2202,9 @@ static int dw_mipi_dsi2_host_attach(struct mipi_dsi_host *host,
 		 dsi2->keep_init_clock_non_continuous ?
 		 "defer continuous clock until enable" :
 		 "default Rockchip sequence");
+	dsi2->esd_recovery_enabled =
+		of_device_is_compatible(device->dev.of_node, "simple-panel-dsi") &&
+		of_property_read_bool(device->dev.of_node, "violoop,esd-auto-recover");
 
 	ret = dw_mipi_dsi2_dual_channel_probe(dsi2);
 	if (ret)
@@ -1778,14 +2250,23 @@ static int dw_mipi_dsi2_read_from_fifo(struct dw_mipi_dsi2 *dsi2,
 	u8 data_type;
 	u16 wc;
 	int i, j, ret, len = msg->rx_len;
-	unsigned int vrefresh = drm_mode_vrefresh(&dsi2->mode);
 	u32 val;
 
+	/*
+	 * Never derive this timeout from the cached mode.  During a
+	 * bootloader-to-kernel handoff the cached mode may not have been filled
+	 * yet, so drm_mode_vrefresh() can return zero.  Passing a zero timeout to
+	 * regmap_read_poll_timeout() means "wait forever" and a damaged or
+	 * unresponsive panel can then pin a caller in the kernel indefinitely.
+	 * A fixed, non-zero deadline also makes panel ESD probing recoverable.
+	 */
 	ret = regmap_read_poll_timeout(dsi2->regmap, DSI2_CORE_STATUS,
 				       val, val & CRI_RD_DATA_AVAIL,
-				       0, DIV_ROUND_UP(1000000, vrefresh));
+				       10, READ_PKT_STATUS_TIMEOUT_US);
 	if (ret) {
-		DRM_DEV_ERROR(dsi2->dev, "CRI has no available read data\n");
+		DRM_DEV_ERROR(dsi2->dev,
+			      "CRI read response timed out after %u us: status=0x%08x\n",
+			      READ_PKT_STATUS_TIMEOUT_US, val);
 		return ret;
 	}
 
@@ -1818,17 +2299,8 @@ static ssize_t dw_mipi_dsi2_transfer(struct dw_mipi_dsi2 *dsi2,
 	u32 val;
 	u32 mode;
 
+	mutex_lock(&dsi2->transfer_lock);
 	pm_runtime_get_sync(dsi2->dev);
-	/*
-	 * Preserve the original Rockchip behaviour unless the attached panel
-	 * explicitly asks to keep the pre-enable/non-continuous clock policy
-	 * throughout its LP initialization sequence. dw_mipi_dsi2_enable()
-	 * always applies the final clock policy before video starts.
-	 */
-	if (!dsi2->keep_init_clock_non_continuous || dsi2->enabled)
-		dw_mipi_dsi2_clk_management(dsi2);
-	regmap_update_bits(dsi2->regmap, DSI2_DSI_VID_TX_CFG, LPDT_DISPLAY_CMD_EN,
-			   msg->flags & MIPI_DSI_MSG_USE_LPM ? LPDT_DISPLAY_CMD_EN : 0);
 
 	/* create a packet to the DSI protocol */
 	ret = mipi_dsi_create_packet(&packet, msg);
@@ -1838,8 +2310,35 @@ static ssize_t dw_mipi_dsi2_transfer(struct dw_mipi_dsi2 *dsi2,
 	}
 
 	ret = cri_fifos_wait_avail(dsi2);
-	if (ret)
-		goto err;
+	if (ret) {
+		if (!dsi2->esd_recovery_enabled)
+			goto err;
+		/*
+		 * Always allow an init/write command to clear a stale read.  Health
+		 * reads are rate-limited so a physically absent panel cannot make
+		 * the live video host reset every polling interval.
+		 */
+		if (!msg->rx_len || !dsi2->last_host_recovery ||
+		    time_after_eq(jiffies, dsi2->last_host_recovery +
+					 msecs_to_jiffies(30000))) {
+			ret = dw_mipi_dsi2_recover_host(dsi2);
+			if (ret)
+				goto err;
+			ret = cri_fifos_wait_avail(dsi2);
+		}
+		if (ret) {
+			if (msg->rx_len)
+				dw_mipi_dsi2_note_read_timeout(dsi2);
+			goto err;
+		}
+	}
+
+	if (!dsi2->keep_init_clock_non_continuous || dsi2->enabled)
+		dw_mipi_dsi2_clk_management(dsi2);
+	regmap_update_bits(dsi2->regmap, DSI2_DSI_VID_TX_CFG,
+			   LPDT_DISPLAY_CMD_EN,
+			   msg->flags & MIPI_DSI_MSG_USE_LPM ?
+			   LPDT_DISPLAY_CMD_EN : 0);
 
 	/* Send payload */
 	while (DIV_ROUND_UP(packet.payload_length, 4)) {
@@ -1864,25 +2363,59 @@ static ssize_t dw_mipi_dsi2_transfer(struct dw_mipi_dsi2 *dsi2,
 
 	regmap_write(dsi2->regmap, DSI2_CRI_TX_HDR, mode | val);
 
-	ret = cri_fifos_wait_avail(dsi2);
-	if (ret)
-		goto err;
-
 	if (msg->rx_len) {
+		/*
+		 * A read keeps CRI_BUSY asserted until its BTA response is consumed.
+		 * Waiting for an entirely idle CRI before draining the RX FIFO creates
+		 * a circular wait and used to reset the live DPHY every ESD interval.
+		 */
 		ret = dw_mipi_dsi2_read_from_fifo(dsi2, msg);
-		if (ret < 0)
+		if (ret < 0) {
+			/* Clear a genuinely abandoned BTA transaction, but rate-limit
+			 * health-read recovery so an absent panel cannot reset the DPHY
+			 * every polling interval.
+			 */
+			if (!dsi2->last_host_recovery ||
+			    time_after_eq(jiffies, dsi2->last_host_recovery +
+					  msecs_to_jiffies(30000))) {
+				dw_mipi_dsi2_recover_host(dsi2);
+			}
+
+			dw_mipi_dsi2_note_read_timeout(dsi2);
 			goto err;
+		}
+		WRITE_ONCE(dsi2->consecutive_read_timeouts, 0);
+
+		ret = cri_fifos_wait_avail(dsi2);
+		if (ret)
+			goto err;
+	} else {
+		ret = cri_fifos_wait_avail(dsi2);
+		if (ret) {
+			/* Never resend an already-submitted write packet: the panel may
+			 * have accepted it.  Rebuild the host for the next command only.
+			 */
+			dw_mipi_dsi2_recover_host(dsi2);
+			goto err;
+		}
 	}
 
 	pm_runtime_put(dsi2->dev);
+	mutex_unlock(&dsi2->transfer_lock);
 
 	if (dsi2->slave)
 		dw_mipi_dsi2_transfer(dsi2->slave, msg);
 
-	return msg->tx_len;
+	/* A DSI host transfer reports received bytes for reads and transmitted
+	 * bytes for writes.  Returning tx_len unconditionally made every
+	 * multi-byte DCS read (for example GET_SCANLINE) look truncated even
+	 * though the RX FIFO contained the complete response.
+	 */
+	return msg->rx_len ? msg->rx_len : msg->tx_len;
 
 err:
 	pm_runtime_put(dsi2->dev);
+	mutex_unlock(&dsi2->transfer_lock);
 	return ret;
 }
 
@@ -1894,10 +2427,30 @@ static ssize_t dw_mipi_dsi2_host_transfer(struct mipi_dsi_host *host,
 	return dw_mipi_dsi2_transfer(dsi2, msg);
 }
 
+static int
+dw_mipi_dsi2_host_request_esd_recovery(struct mipi_dsi_host *host,
+					struct mipi_dsi_device *dsi)
+{
+	struct dw_mipi_dsi2 *dsi2 = host_to_dsi2(host);
+
+	if (!dsi2->esd_recovery_enabled)
+		return -EOPNOTSUPP;
+	if (!dsi2->drm_dev || !READ_ONCE(dsi2->enabled) ||
+	    READ_ONCE(dsi2->esd_removing))
+		return -EHOSTDOWN;
+
+	dev_warn(dsi2->dev,
+		 "panel requested coordinated DRM modeset recovery\n");
+	dw_mipi_dsi2_request_esd_modeset(dsi2);
+
+	return 0;
+}
+
 static const struct mipi_dsi_host_ops dw_mipi_dsi2_host_ops = {
 	.attach = dw_mipi_dsi2_host_attach,
 	.detach = dw_mipi_dsi2_host_detach,
 	.transfer = dw_mipi_dsi2_host_transfer,
+	.request_esd_recovery = dw_mipi_dsi2_host_request_esd_recovery,
 };
 
 static int dw_mipi_dsi2_probe(struct platform_device *pdev)
@@ -1920,6 +2473,13 @@ static int dw_mipi_dsi2_probe(struct platform_device *pdev)
 	dsi2->dev = dev;
 	dsi2->id = id;
 	dsi2->pdata = of_device_get_match_data(dev);
+	mutex_init(&dsi2->transfer_lock);
+	INIT_WORK(&dsi2->esd_modeset_work, dw_mipi_dsi2_esd_modeset_work);
+	INIT_DELAYED_WORK(&dsi2->esd_fault_poll_work,
+			  dw_mipi_dsi2_esd_fault_poll_work);
+	atomic_set(&dsi2->esd_modeset_pending, 0);
+	atomic_set(&dsi2->esd_lifecycle_generation, 0);
+	atomic_set(&dsi2->irq_fault_count, 0);
 	platform_set_drvdata(pdev, dsi2);
 
 	if (device_property_read_bool(dev, "auto-calculation-mode"))
@@ -2035,8 +2595,12 @@ static int dw_mipi_dsi2_remove(struct platform_device *pdev)
 {
 	struct dw_mipi_dsi2 *dsi2 = platform_get_drvdata(pdev);
 
+	WRITE_ONCE(dsi2->esd_removing, true);
+	WRITE_ONCE(dsi2->esd_monitor_running, false);
+	cancel_delayed_work_sync(&dsi2->esd_fault_poll_work);
+	cancel_work_sync(&dsi2->esd_modeset_work);
+	dw_mipi_dsi2_stop_vblank_watch(dsi2);
 	mipi_dsi_host_unregister(&dsi2->host);
-
 	return 0;
 }
 

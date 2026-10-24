@@ -32,6 +32,7 @@
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
 #include <linux/spi/spi.h>
+#include <linux/workqueue.h>
 #include <linux/rockchip-panel-notifier.h>
 
 #include <video/display_timing.h>
@@ -190,12 +191,53 @@ struct panel_desc {
 	int (*spi_write)(struct device *dev, const u8 *data, size_t len, u8 type);
 };
 
+#define PANEL_SIMPLE_ESD_HISTORY_LEN	36
+
+struct panel_simple_esd_sample {
+	u64 time_ms;
+	u32 check;
+	s32 ret;
+	u32 failures;
+	u32 recoveries;
+	u8 power;
+	u8 signal;
+	u8 diagnostic;
+	u8 dsi_errors;
+	bool healthy;
+	bool transport_pending;
+};
+
 struct panel_simple {
 	struct drm_panel base;
 	struct mipi_dsi_device *dsi;
 	bool enabled;
 	bool dcs_display_control;
 	bool dcs_display_on;
+	bool esd_status_check;
+	bool dcs_brightness_cache_only;
+	bool esd_auto_recover;
+	bool esd_watchdog_running;
+	bool esd_feedback_verified;
+	bool esd_status_valid;
+	bool esd_last_healthy;
+	bool esd_transport_fault_pending;
+	bool esd_post_pipeline_reinit_pending;
+	u8 esd_power;
+	u8 esd_signal;
+	u8 esd_diagnostic;
+	u8 esd_dsi_errors;
+	int esd_last_error;
+	u32 esd_checks;
+	u32 esd_failures;
+	u32 esd_recoveries;
+	unsigned long esd_last_recovery;
+	unsigned long esd_last_host_request;
+	unsigned long esd_post_pipeline_reinit_after;
+	struct panel_simple_esd_sample
+		esd_history[PANEL_SIMPLE_ESD_HISTORY_LEN];
+	u32 esd_history_head;
+	u32 esd_history_count;
+	struct delayed_work esd_work;
 	struct mutex dcs_lock;
 
 	bool prepared;
@@ -225,6 +267,37 @@ struct panel_simple {
 
 	struct rockchip_panel_notifier panel_notifier;
 };
+
+#define PANEL_SIMPLE_ESD_INTERVAL_MS	3000
+#define PANEL_SIMPLE_ESD_FAST_RETRY_MS	250
+#define PANEL_SIMPLE_ESD_FAIL_LIMIT	1
+#define PANEL_SIMPLE_ESD_COOLDOWN_MS	3000
+#define PANEL_SIMPLE_ESD_PIPELINE_SETTLE_MS	1000
+#define PANEL_SIMPLE_ESD_SIGNAL_ERROR	BIT(0)
+#define PANEL_SIMPLE_ESD_DIAGNOSTIC_ERROR	(BIT(6) | BIT(5) | BIT(4) | \
+						 BIT(1) | BIT(0))
+static void panel_simple_esd_work(struct work_struct *work);
+
+static void panel_simple_esd_start(struct panel_simple *p)
+{
+	if (p->esd_auto_recover) {
+		unsigned int delay_ms = p->esd_transport_fault_pending ?
+			PANEL_SIMPLE_ESD_FAST_RETRY_MS :
+			PANEL_SIMPLE_ESD_INTERVAL_MS;
+
+		WRITE_ONCE(p->esd_watchdog_running, true);
+		mod_delayed_work(system_wq, &p->esd_work,
+				 msecs_to_jiffies(delay_ms));
+	}
+}
+
+static void panel_simple_esd_stop(struct panel_simple *p)
+{
+	if (p->esd_auto_recover) {
+		WRITE_ONCE(p->esd_watchdog_running, false);
+		cancel_delayed_work_sync(&p->esd_work);
+	}
+}
 
 static inline void panel_simple_msleep(unsigned int msecs)
 {
@@ -344,8 +417,15 @@ static int panel_simple_xfer_dsi_cmd_seq(struct panel_simple *panel,
 			return -EINVAL;
 		}
 
-		if (err < 0)
-			dev_err(dev, "failed to write dcs cmd: %d\n", err);
+		if (err < 0) {
+			dev_err(dev,
+				"failed to write panel cmd[%u]: type=0x%02x cmd=0x%02x err=%d\n",
+				i, cmd->header.data_type,
+				cmd->header.payload_length ? cmd->payload[0] : 0,
+				err);
+			if (panel->esd_auto_recover)
+				return err;
+		}
 
 		if (cmd->header.delay)
 			panel_simple_msleep(cmd->header.delay);
@@ -539,6 +619,7 @@ int panel_simple_loader_protect(struct drm_panel *panel)
 	mutex_lock(&p->dcs_lock);
 	p->dcs_display_on = true;
 	mutex_unlock(&p->dcs_lock);
+	panel_simple_esd_start(p);
 
 	return 0;
 }
@@ -547,6 +628,8 @@ EXPORT_SYMBOL(panel_simple_loader_protect);
 static int panel_simple_disable(struct drm_panel *panel)
 {
 	struct panel_simple *p = to_panel_simple(panel);
+
+	panel_simple_esd_stop(p);
 
 	/*
 	 * notify other devices (such as TP) to perform the action before the
@@ -569,6 +652,8 @@ static int panel_simple_disable(struct drm_panel *panel)
 static int panel_simple_unprepare(struct drm_panel *panel)
 {
 	struct panel_simple *p = to_panel_simple(panel);
+
+	panel_simple_esd_stop(p);
 
 	/* Unpreparing when already unprepared is a no-op */
 	if (!p->prepared)
@@ -670,6 +755,7 @@ static int panel_simple_enable(struct drm_panel *panel)
 	 */
 	rockchip_panel_notifier_call_chain(&p->panel_notifier,
 					   PANEL_ENABLED, NULL);
+	panel_simple_esd_start(p);
 
 	return 0;
 }
@@ -834,20 +920,21 @@ static int dcs_bl_update_status(struct backlight_device *bl)
 {
 	struct panel_simple *p = bl_get_data(bl);
 	struct mipi_dsi_device *dsi = p->dsi;
+	unsigned long mode_flags;
 	int ret;
 
-	if (!p->prepared)
-		return 0;
-
+	mutex_lock(&p->dcs_lock);
+	if (!p->prepared) {
+		ret = 0;
+		goto out;
+	}
+	mode_flags = dsi->mode_flags;
 	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
-
 	ret = mipi_dsi_dcs_set_display_brightness(dsi, bl->props.brightness);
-	if (ret < 0)
-		return ret;
-
-	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
-
-	return 0;
+	dsi->mode_flags = mode_flags;
+out:
+	mutex_unlock(&p->dcs_lock);
+	return ret < 0 ? ret : 0;
 }
 
 static int panel_simple_set_display_power(struct panel_simple *p, bool on)
@@ -907,6 +994,300 @@ static ssize_t display_power_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(display_power);
 
+static int panel_simple_read_dcs_byte(struct panel_simple *p, u8 cmd, u8 *value)
+{
+	ssize_t ret = mipi_dsi_dcs_read(p->dsi, cmd, value, sizeof(*value));
+
+	return ret < 0 ? ret : ret == sizeof(*value) ? 0 : -EIO;
+}
+
+static int panel_simple_read_esd_status(struct panel_simple *p, u8 *power,
+				      u8 *signal, u8 *diagnostic, u8 *errors)
+{
+	unsigned long flags;
+	int ret;
+
+	if (!p->prepared || !p->dsi)
+		return -EHOSTDOWN;
+	*power = *signal = *diagnostic = *errors = 0;
+	flags = p->dsi->mode_flags;
+	p->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+	ret = mipi_dsi_dcs_get_power_mode(p->dsi, power);
+	if (ret)
+		goto out;
+	/* Read signal status before 0x05, which clears the error indication. */
+	ret = panel_simple_read_dcs_byte(p, MIPI_DCS_GET_SIGNAL_MODE, signal);
+	if (ret)
+		goto out;
+	ret = panel_simple_read_dcs_byte(p, MIPI_DCS_GET_DIAGNOSTIC_RESULT,
+					 diagnostic);
+	if (ret)
+		goto out;
+	ret = panel_simple_read_dcs_byte(p, MIPI_DCS_GET_ERROR_COUNT_ON_DSI,
+					 errors);
+out:
+	p->dsi->mode_flags = flags;
+	return ret;
+}
+
+static bool panel_simple_esd_healthy(u8 power, u8 signal, u8 diagnostic,
+				    u8 errors)
+{
+	return power == 0x9c && !(signal & PANEL_SIMPLE_ESD_SIGNAL_ERROR) &&
+	       !(diagnostic & PANEL_SIMPLE_ESD_DIAGNOSTIC_ERROR) && !errors;
+}
+
+static void panel_simple_esd_sample(struct panel_simple *p, int ret, u8 power,
+				   u8 signal, u8 diagnostic, u8 errors)
+{
+	struct panel_simple_esd_sample *sample;
+
+	p->esd_last_error = ret;
+	p->esd_status_valid = !ret;
+	p->esd_last_healthy = !ret &&
+		panel_simple_esd_healthy(power, signal, diagnostic, errors);
+	p->esd_power = power;
+	p->esd_signal = signal;
+	p->esd_diagnostic = diagnostic;
+	p->esd_dsi_errors = errors;
+	sample = &p->esd_history[p->esd_history_head];
+	sample->time_ms = ktime_to_ms(ktime_get_boottime());
+	sample->check = p->esd_checks;
+	sample->ret = ret;
+	sample->failures = p->esd_failures;
+	sample->recoveries = p->esd_recoveries;
+	sample->power = power;
+	sample->signal = signal;
+	sample->diagnostic = diagnostic;
+	sample->dsi_errors = errors;
+	sample->healthy = p->esd_last_healthy;
+	sample->transport_pending = p->esd_transport_fault_pending;
+	p->esd_history_head = (p->esd_history_head + 1) %
+		PANEL_SIMPLE_ESD_HISTORY_LEN;
+	if (p->esd_history_count < PANEL_SIMPLE_ESD_HISTORY_LEN)
+		p->esd_history_count++;
+}
+
+static int panel_simple_esd_recover_locked(struct panel_simple *p)
+{
+	unsigned long flags;
+	u8 power = 0, signal = 0, diagnostic = 0, errors = 0;
+	int ret;
+
+	if (!p->prepared || !p->enabled || !p->dsi || !p->reset_gpio ||
+	    !p->dcs_display_on)
+		return -EHOSTDOWN;
+	dev_warn(p->base.dev, "panel ESD full reinit begin: check=%u failures=%u\n",
+		 p->esd_checks, p->esd_failures);
+	flags = p->dsi->mode_flags;
+	p->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+	if (p->esd_status_valid && p->esd_power == 0x98) {
+		ret = mipi_dsi_dcs_set_display_on(p->dsi);
+		if (ret >= 0) {
+			panel_simple_msleep(40);
+			ret = panel_simple_read_esd_status(p, &power, &signal,
+						   &diagnostic, &errors);
+			if (!ret && panel_simple_esd_healthy(power, signal,
+							 diagnostic, errors))
+				goto out;
+		}
+	}
+	/* Preserve the validated reset/init path: no VCI cycle or SLEEP_IN. */
+	ret = gpiod_direction_output(p->reset_gpio, 1);
+	if (ret)
+		goto out;
+	panel_simple_msleep(max_t(unsigned int, p->desc->delay.reset, 10));
+	ret = gpiod_direction_output(p->reset_gpio, 0);
+	if (ret)
+		goto out;
+	panel_simple_msleep(max_t(unsigned int, p->desc->delay.init, 10));
+	if (p->desc->init_seq)
+		ret = panel_simple_xfer_dsi_cmd_seq(p, p->desc->init_seq);
+	if (!ret && p->base.backlight)
+		ret = mipi_dsi_dcs_set_display_brightness(p->dsi,
+					p->base.backlight->props.brightness);
+	if (ret)
+		goto out;
+	panel_simple_msleep(40);
+	ret = panel_simple_read_esd_status(p, &power, &signal,
+					   &diagnostic, &errors);
+	if (!ret && power == 0x98) {
+		ret = mipi_dsi_dcs_set_display_on(p->dsi);
+		if (ret >= 0) {
+			panel_simple_msleep(40);
+			ret = panel_simple_read_esd_status(p, &power, &signal,
+							   &diagnostic, &errors);
+		}
+	}
+	if (!ret && !panel_simple_esd_healthy(power, signal, diagnostic, errors))
+		ret = -EIO;
+out:
+	p->dsi->mode_flags = flags;
+	p->esd_recoveries++;
+	panel_simple_esd_sample(p, ret, power, signal, diagnostic, errors);
+	dev_warn(p->base.dev,
+		 "panel ESD full reinit %s: ret=%d power=0x%02x signal=0x%02x diagnostic=0x%02x dsi_errors=%u attempts=%u\n",
+		 ret ? "failed" : "status verified", ret, power, signal,
+		 diagnostic, errors, p->esd_recoveries);
+	return ret;
+}
+
+static void panel_simple_esd_work(struct work_struct *work)
+{
+	struct panel_simple *p = container_of(to_delayed_work(work),
+					      struct panel_simple, esd_work);
+	u8 power = 0, signal = 0, diagnostic = 0, errors = 0;
+	unsigned int delay_ms = PANEL_SIMPLE_ESD_INTERVAL_MS;
+	bool healthy, reinit = false;
+	int ret, host_ret;
+
+	if (!READ_ONCE(p->esd_watchdog_running))
+		return;
+	mutex_lock(&p->dcs_lock);
+	/* A normal userspace display-off request must not trigger recovery. */
+	if (!p->prepared || !p->enabled || !p->dcs_display_on)
+		goto unlock;
+	ret = panel_simple_read_esd_status(p, &power, &signal,
+					   &diagnostic, &errors);
+	p->esd_checks++;
+	healthy = !ret && panel_simple_esd_healthy(power, signal, diagnostic, errors);
+	if (healthy) {
+		if (!p->esd_feedback_verified)
+			dev_info(p->base.dev,
+				 "panel ESD monitor armed: power=0x%02x interval=%ums\n",
+				 power, PANEL_SIMPLE_ESD_INTERVAL_MS);
+		p->esd_feedback_verified = true;
+		p->esd_failures = 0;
+		if (p->esd_transport_fault_pending) {
+			p->esd_transport_fault_pending = false;
+			p->esd_post_pipeline_reinit_pending = true;
+			p->esd_post_pipeline_reinit_after = jiffies +
+				msecs_to_jiffies(PANEL_SIMPLE_ESD_PIPELINE_SETTLE_MS);
+			delay_ms = PANEL_SIMPLE_ESD_PIPELINE_SETTLE_MS;
+		} else if (p->esd_post_pipeline_reinit_pending) {
+			if (time_after_eq(jiffies, p->esd_post_pipeline_reinit_after)) {
+				p->esd_post_pipeline_reinit_pending = false;
+				reinit = true;
+			} else {
+				delay_ms = max_t(unsigned int, 1, jiffies_to_msecs(
+					p->esd_post_pipeline_reinit_after - jiffies));
+			}
+		}
+	} else if (p->esd_feedback_verified) {
+		if (ret < 0) {
+			p->esd_transport_fault_pending = true;
+			p->esd_failures = 0;
+			delay_ms = PANEL_SIMPLE_ESD_FAST_RETRY_MS;
+			/* Accepted asynchronous work is not proof of completion. */
+			if (!p->esd_last_host_request ||
+			    time_after_eq(jiffies, p->esd_last_host_request +
+				msecs_to_jiffies(PANEL_SIMPLE_ESD_COOLDOWN_MS))) {
+				host_ret = mipi_dsi_host_request_esd_recovery(p->dsi);
+				p->esd_last_host_request = jiffies;
+				dev_warn(p->base.dev,
+					 "panel ESD transport fault: ret=%d host_request=%d\n",
+					 ret, host_ret);
+			}
+		} else {
+			p->esd_failures++;
+		}
+		dev_warn_ratelimited(p->base.dev,
+			 "panel ESD health failed: ret=%d power=0x%02x signal=0x%02x diagnostic=0x%02x dsi_errors=%u\n",
+			 ret, power, signal, diagnostic, errors);
+	} else {
+		dev_warn_ratelimited(p->base.dev,
+			 "panel ESD feedback not qualified: ret=%d power=0x%02x; automatic reset not armed\n",
+			 ret, power);
+	}
+	panel_simple_esd_sample(p, ret, power, signal, diagnostic, errors);
+	if (p->esd_feedback_verified &&
+	    (reinit || p->esd_failures >= PANEL_SIMPLE_ESD_FAIL_LIMIT) &&
+	    (reinit || !p->esd_last_recovery || time_after_eq(jiffies,
+		p->esd_last_recovery + msecs_to_jiffies(PANEL_SIMPLE_ESD_COOLDOWN_MS)))) {
+		ret = panel_simple_esd_recover_locked(p);
+		p->esd_last_recovery = jiffies;
+		p->esd_failures = 0;
+		if (ret) {
+			p->esd_transport_fault_pending = true;
+			host_ret = mipi_dsi_host_request_esd_recovery(p->dsi);
+			p->esd_last_host_request = jiffies;
+			dev_warn(p->base.dev,
+				 "panel ESD reinit failed: ret=%d host_request=%d\n",
+				 ret, host_ret);
+			delay_ms = PANEL_SIMPLE_ESD_FAST_RETRY_MS;
+		}
+	}
+unlock:
+	mutex_unlock(&p->dcs_lock);
+	if (READ_ONCE(p->esd_watchdog_running))
+		mod_delayed_work(system_wq, &p->esd_work, msecs_to_jiffies(delay_ms));
+}
+
+static ssize_t esd_status_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct panel_simple *p = dev_get_drvdata(dev);
+	ssize_t len;
+
+	mutex_lock(&p->dcs_lock);
+	len = sysfs_emit(buf,
+		"ok=%u error=%d power=0x%02x signal=0x%02x diagnostic=0x%02x dsi_errors=%u verified=%u checks=%u failures=%u recoveries=%u watchdog=%u\n",
+		p->esd_status_valid && p->esd_last_healthy, p->esd_last_error,
+		p->esd_power, p->esd_signal, p->esd_diagnostic, p->esd_dsi_errors,
+		p->esd_feedback_verified, p->esd_checks, p->esd_failures,
+		p->esd_recoveries, p->esd_watchdog_running);
+	mutex_unlock(&p->dcs_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(esd_status);
+
+static ssize_t esd_history_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct panel_simple *p = dev_get_drvdata(dev);
+	u32 i, index;
+	ssize_t len = 0;
+
+	mutex_lock(&p->dcs_lock);
+	index = (p->esd_history_head + PANEL_SIMPLE_ESD_HISTORY_LEN -
+		 p->esd_history_count) % PANEL_SIMPLE_ESD_HISTORY_LEN;
+	for (i = 0; i < p->esd_history_count && len < PAGE_SIZE - 160; i++) {
+		const struct panel_simple_esd_sample *s = &p->esd_history[index];
+
+		len += sysfs_emit_at(buf, len,
+			"t=%llu c=%u r=%d p=%02x s=%02x d=%02x e=%u h=%u f=%u rec=%u tp=%u\n",
+			(unsigned long long)s->time_ms, s->check, s->ret, s->power,
+			s->signal, s->diagnostic, s->dsi_errors, s->healthy,
+			s->failures, s->recoveries, s->transport_pending);
+		index = (index + 1) % PANEL_SIMPLE_ESD_HISTORY_LEN;
+	}
+	mutex_unlock(&p->dcs_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(esd_history);
+
+static ssize_t esd_recover_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct panel_simple *p = dev_get_drvdata(dev);
+	bool recover;
+	int ret = kstrtobool(buf, &recover);
+
+	if (ret)
+		return ret;
+	if (!recover)
+		return -EINVAL;
+	mutex_lock(&p->dcs_lock);
+	ret = panel_simple_esd_recover_locked(p);
+	p->esd_last_error = ret;
+	p->esd_last_recovery = jiffies;
+	p->esd_failures = 0;
+	mutex_unlock(&p->dcs_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(esd_recover);
+
 static struct attribute *panel_simple_dcs_attrs[] = {
 	&dev_attr_display_power.attr,
 	NULL,
@@ -916,25 +1297,54 @@ static const struct attribute_group panel_simple_dcs_attr_group = {
 	.attrs = panel_simple_dcs_attrs,
 };
 
+static struct attribute *panel_simple_esd_attrs[] = {
+	&dev_attr_esd_status.attr,
+	&dev_attr_esd_history.attr,
+	&dev_attr_esd_recover.attr,
+	NULL,
+};
+
+static const struct attribute_group panel_simple_esd_attr_group = {
+	.attrs = panel_simple_esd_attrs,
+};
+
 static int dcs_bl_get_brightness(struct backlight_device *bl)
 {
 	struct panel_simple *p = bl_get_data(bl);
 	struct mipi_dsi_device *dsi = p->dsi;
+	unsigned long mode_flags;
 	u16 brightness = bl->props.brightness;
 	int ret;
 
+	/*
+	 * Backlight restore runs before the panel is prepared on this board.
+	 * Returning zero here makes systemd-backlight replace the intended
+	 * 255 default with its 5% floor (12), causing a black-to-dim boot.
+	 * The controller cannot be queried yet, so return the cached value.
+	 */
 	if (!p->prepared)
-		return 0;
+		return p->dcs_brightness_cache_only ? bl->props.brightness : 0;
+	/* The approved TL V4 panels do not provide reliable DCS 0x52
+	 * readback.  Keep writes functional while serving sysfs reads from the
+	 * backlight core's cached value.
+	 */
+	if (p->dcs_brightness_cache_only)
+		return bl->props.brightness;
 
+	mutex_lock(&p->dcs_lock);
+	if (!p->prepared) {
+		ret = bl->props.brightness;
+		goto out;
+	}
+	mode_flags = dsi->mode_flags;
 	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
-
 	ret = mipi_dsi_dcs_get_display_brightness(dsi, &brightness);
-	if (ret < 0)
-		return ret;
-
-	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
-
-	return brightness & 0xff;
+	dsi->mode_flags = mode_flags;
+	if (ret >= 0)
+		ret = brightness & 0xff;
+out:
+	mutex_unlock(&p->dcs_lock);
+	return ret;
 }
 
 static const struct backlight_ops dcs_bl_ops = {
@@ -957,6 +1367,7 @@ static int panel_simple_probe(struct device *dev, const struct panel_desc *desc)
 
 	panel->enabled = false;
 	mutex_init(&panel->dcs_lock);
+	INIT_DELAYED_WORK(&panel->esd_work, panel_simple_esd_work);
 	panel->prepared_time = 0;
 	panel->desc = desc;
 
@@ -1096,6 +1507,7 @@ static void panel_simple_remove(struct device *dev)
 {
 	struct panel_simple *panel = dev_get_drvdata(dev);
 
+	panel_simple_esd_stop(panel);
 	drm_panel_remove(&panel->base);
 	drm_panel_disable(&panel->base);
 	drm_panel_unprepare(&panel->base);
@@ -5190,6 +5602,17 @@ static int panel_simple_dsi_probe(struct mipi_dsi_device *dsi)
 	panel->dcs_display_control =
 		of_property_read_bool(dev->of_node,
 				      "rockchip,dcs-display-control");
+	panel->esd_status_check =
+		of_property_read_bool(dev->of_node,
+				      "violoop,esd-status-check");
+	panel->dcs_brightness_cache_only =
+		of_property_read_bool(dev->of_node,
+				      "violoop,dcs-brightness-cache-only");
+	panel->esd_auto_recover =
+		of_property_read_bool(dev->of_node,
+				      "violoop,esd-auto-recover");
+	if (panel->esd_auto_recover)
+		panel->esd_status_check = true;
 
 	if (!panel->base.backlight) {
 		struct backlight_properties props;
@@ -5215,6 +5638,14 @@ static int panel_simple_dsi_probe(struct mipi_dsi_device *dsi)
 		err = devm_device_add_group(dev, &panel_simple_dcs_attr_group);
 		if (err) {
 			dev_err(dev, "failed to register DCS display control: %d\n",
+				err);
+			return err;
+		}
+	}
+	if (panel->esd_status_check) {
+		err = devm_device_add_group(dev, &panel_simple_esd_attr_group);
+		if (err) {
+			dev_err(dev, "failed to register panel ESD status: %d\n",
 				err);
 			return err;
 		}

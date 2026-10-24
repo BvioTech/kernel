@@ -1043,6 +1043,8 @@ static DRM_ENUM_NAME_FN(drm_get_bus_format_name, drm_bus_format_enum_list)
 
 static inline void vop2_cfg_done(struct drm_crtc *crtc);
 static void vop2_wait_for_fs_by_done_bit_status(struct vop2_video_port *vp);
+static void vop2_dsp_hold_valid_irq_enable(struct drm_crtc *crtc);
+static void vop2_dsp_hold_valid_irq_disable(struct drm_crtc *crtc);
 
 static inline struct vop2_video_port *to_vop2_video_port(struct drm_crtc *crtc)
 {
@@ -1211,8 +1213,23 @@ static void vop2_crtc_standby(struct drm_crtc *crtc, bool standby)
 	struct vop2 *vop2 = vp->vop2;
 
 	if (standby) {
+		if (!of_machine_is_compatible("violoop,rk3576-vla11")) {
+			VOP_MODULE_SET(vop2, vp, standby, 1);
+			mdelay(20);
+			return;
+		}
+		/* Wait for the current frame to drain before changing DSI mode. */
+		reinit_completion(&vp->dsp_hold_completion);
+		vop2_dsp_hold_valid_irq_enable(crtc);
+		spin_lock(&vop2->reg_lock);
 		VOP_MODULE_SET(vop2, vp, standby, 1);
-		mdelay(20);
+		spin_unlock(&vop2->reg_lock);
+		if (!wait_for_completion_timeout(&vp->dsp_hold_completion,
+						 msecs_to_jiffies(100)))
+			DRM_DEV_INFO(vop2->dev,
+				     "wait for vp%d dsp_hold timeout on standby\n",
+				     vp->id);
+		vop2_dsp_hold_valid_irq_disable(crtc);
 	} else {
 		VOP_MODULE_SET(vop2, vp, standby, 0);
 	}

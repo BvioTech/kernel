@@ -68,6 +68,7 @@ int mipi_dsi_create_packet(struct mipi_dsi_packet *packet,
  * @attach: attach DSI device to DSI host
  * @detach: detach DSI device from DSI host
  * @transfer: transmit a DSI packet
+ * @request_esd_recovery: request an asynchronous host/display-pipeline rebuild
  *
  * DSI packets transmitted by .transfer() are passed in as mipi_dsi_msg
  * structures. This structure contains information about the type of packet
@@ -93,6 +94,8 @@ struct mipi_dsi_host_ops {
 		      struct mipi_dsi_device *dsi);
 	ssize_t (*transfer)(struct mipi_dsi_host *host,
 			    const struct mipi_dsi_msg *msg);
+	int (*request_esd_recovery)(struct mipi_dsi_host *host,
+				    struct mipi_dsi_device *dsi);
 };
 
 /**
@@ -239,6 +242,7 @@ devm_mipi_dsi_device_register_full(struct device *dev, struct mipi_dsi_host *hos
 struct mipi_dsi_device *of_find_mipi_dsi_device_by_node(struct device_node *np);
 int mipi_dsi_attach(struct mipi_dsi_device *dsi);
 int mipi_dsi_detach(struct mipi_dsi_device *dsi);
+int mipi_dsi_host_request_esd_recovery(struct mipi_dsi_device *dsi);
 int devm_mipi_dsi_attach(struct device *dev, struct mipi_dsi_device *dsi);
 int mipi_dsi_shutdown_peripheral(struct mipi_dsi_device *dsi);
 int mipi_dsi_turn_on_peripheral(struct mipi_dsi_device *dsi);
