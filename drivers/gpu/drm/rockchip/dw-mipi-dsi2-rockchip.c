@@ -47,12 +47,18 @@
 
 #if IS_REACHABLE(CONFIG_DRM_PANEL_JUJING_JN3929595A)
 int panel_jujing_jn3929595a_loader_protect(struct drm_panel *panel);
+void panel_jujing_jn3929595a_esd_modeset_begin(struct drm_panel *panel);
+void panel_jujing_jn3929595a_esd_modeset_end(struct drm_panel *panel);
 #else
 static inline int
 panel_jujing_jn3929595a_loader_protect(struct drm_panel *panel)
 {
 	return 0;
 }
+static inline void
+panel_jujing_jn3929595a_esd_modeset_begin(struct drm_panel *panel) { }
+static inline void
+panel_jujing_jn3929595a_esd_modeset_end(struct drm_panel *panel) { }
 #endif
 
 #define UPDATE(v, h, l)			(((v) << (l)) & GENMASK((h), (l)))
@@ -196,6 +202,8 @@ panel_jujing_jn3929595a_loader_protect(struct drm_panel *panel)
 #define DSI2_ESD_VBLANK_CHECK_MS		1500
 #define DSI2_ESD_VBLANK_STALL_LIMIT	2
 #define DSI2_ESD_VBLANK_VERIFY_MS	80
+#define DSI2_JUJING_ESD_MAX_REQUESTS	3
+#define DSI2_JUJING_ESD_BACKOFF_MS	120000
 #define PSEC_PER_SEC			1000000000000LL
 
 #define GRF_REG_FIELD(reg, lsb, msb)	(((reg) << 16) | ((lsb) << 8) | (msb))
@@ -326,6 +334,8 @@ struct dw_mipi_dsi2 {
 	struct work_struct esd_modeset_work;
 	struct delayed_work esd_fault_poll_work;
 	atomic_t esd_modeset_pending;
+	unsigned int jujing_esd_requests;
+	unsigned long jujing_esd_retry_after;
 	atomic_t esd_lifecycle_generation;
 	u32 esd_modeset_generation;
 	u32 consecutive_read_timeouts;
@@ -1164,6 +1174,7 @@ static void dw_mipi_dsi2_esd_modeset_work(struct work_struct *work)
 	u64 vblank_before = 0, vblank_after = 0;
 	u32 generation = READ_ONCE(dsi2->esd_modeset_generation);
 	unsigned int attempt;
+	bool panel_marked = false;
 	int ret = -EIO;
 
 	if (!dsi2->drm_dev || !READ_ONCE(dsi2->enabled)) {
@@ -1190,6 +1201,12 @@ static void dw_mipi_dsi2_esd_modeset_work(struct work_struct *work)
 		if (READ_ONCE(dsi2->esd_removing) || !READ_ONCE(dsi2->enabled)) {
 			ret = -ENODEV;
 			break;
+		}
+		if (dsi2->panel &&
+		    of_machine_is_compatible("violoop,rk3576-vla11") &&
+		    of_device_is_compatible(dsi2->client, "jujing,jn3929595a")) {
+			panel_jujing_jn3929595a_esd_modeset_begin(dsi2->panel);
+			panel_marked = true;
 		}
 		ret = dw_mipi_dsi2_force_current_modeset(dsi2, &generation);
 		if (ret) {
@@ -1219,6 +1236,8 @@ static void dw_mipi_dsi2_esd_modeset_work(struct work_struct *work)
 	}
 
 out:
+	if (panel_marked && dsi2->panel)
+		panel_jujing_jn3929595a_esd_modeset_end(dsi2->panel);
 	if (ret)
 		dev_warn(dsi2->dev,
 			 "panel ESD DRM modeset recovery aborted: %d\n", ret);
@@ -1239,6 +1258,29 @@ static void dw_mipi_dsi2_request_esd_modeset(struct dw_mipi_dsi2 *dsi2)
 			msecs_to_jiffies(3000))) {
 		atomic_set(&dsi2->esd_modeset_pending, 0);
 		return;
+	}
+	/* Apply one shared budget to all Jujing triggers, including IRQ,
+	 * vblank and read-timeout paths.  Do not change FPT recovery policy.
+	 * esd_modeset_pending serializes updates to these budget fields.
+	 */
+	if (of_machine_is_compatible("violoop,rk3576-vla11") &&
+	    of_device_is_compatible(dsi2->client, "jujing,jn3929595a")) {
+		if (!dsi2->jujing_esd_requests ||
+		    time_after_eq(jiffies, dsi2->jujing_esd_retry_after)) {
+			dsi2->jujing_esd_requests = 0;
+			dsi2->jujing_esd_retry_after = jiffies +
+				msecs_to_jiffies(DSI2_JUJING_ESD_BACKOFF_MS);
+		}
+		if (dsi2->jujing_esd_requests >= DSI2_JUJING_ESD_MAX_REQUESTS) {
+			dev_warn_ratelimited(dsi2->dev,
+				"Jujing ESD modeset held in backoff\n");
+			atomic_set(&dsi2->esd_modeset_pending, 0);
+			return;
+		}
+		if (++dsi2->jujing_esd_requests >= DSI2_JUJING_ESD_MAX_REQUESTS) {
+			dev_warn(dsi2->dev, "Jujing ESD modeset limit reached; window=%ums\n",
+				 DSI2_JUJING_ESD_BACKOFF_MS);
+		}
 	}
 	dsi2->last_esd_modeset_request = jiffies;
 	WRITE_ONCE(dsi2->esd_modeset_generation, generation);
@@ -2203,7 +2245,10 @@ static int dw_mipi_dsi2_host_attach(struct mipi_dsi_host *host,
 		 "defer continuous clock until enable" :
 		 "default Rockchip sequence");
 	dsi2->esd_recovery_enabled =
-		of_device_is_compatible(device->dev.of_node, "simple-panel-dsi") &&
+		(of_device_is_compatible(device->dev.of_node, "simple-panel-dsi") ||
+		 (of_machine_is_compatible("violoop,rk3576-vla11") &&
+		  of_device_is_compatible(device->dev.of_node,
+					  "jujing,jn3929595a"))) &&
 		of_property_read_bool(device->dev.of_node, "violoop,esd-auto-recover");
 
 	ret = dw_mipi_dsi2_dual_channel_probe(dsi2);
@@ -2272,6 +2317,19 @@ static int dw_mipi_dsi2_read_from_fifo(struct dw_mipi_dsi2 *dsi2,
 
 	regmap_read(dsi2->regmap, DSI2_CRI_RX_HDR, &val);
 	data_type = val & 0x3f;
+	/* Reject ACK/error packets and stale responses when checking this panel. */
+	if (of_machine_is_compatible("violoop,rk3576-vla11") &&
+	    of_device_is_compatible(dsi2->client, "jujing,jn3929595a") &&
+	    dsi2->esd_recovery_enabled && msg->type == MIPI_DSI_DCS_READ &&
+	    msg->tx_len == 1 && msg->tx_buf &&
+	    *(const u8 *)msg->tx_buf == MIPI_DCS_GET_POWER_MODE &&
+	    msg->rx_len == 1 &&
+	    (data_type != MIPI_DSI_RX_DCS_SHORT_READ_RESPONSE_1BYTE ||
+	     ((val >> 6) & 0x3) != msg->channel)) {
+		DRM_DEV_ERROR(dsi2->dev,
+			      "invalid Jujing DCS read response header: 0x%08x\n", val);
+		return -EPROTO;
+	}
 
 	if (mipi_dsi_packet_format_is_short(data_type)) {
 		for (i = 0; i < len && i < 2; i++)
