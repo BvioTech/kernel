@@ -524,28 +524,63 @@ static int csi2_dphy_update_config(struct v4l2_subdev *sd)
 static int csi2_dphy_s_stream_start(struct v4l2_subdev *sd)
 {
 	struct csi2_dphy *dphy = to_csi2_dphy(sd);
+	bool started[RKMODULE_MULTI_DEV_NUM] = { false };
 	int i = 0;
 	int ret = 0;
 
 	ret = csi2_dphy_update_sensor_mbus(sd);
 	if (ret < 0)
-		return ret;
+		goto detach_hw;
 
 	for (i = 0; i < dphy->csi_info.csi_num; i++) {
 		if (dphy->csi_info.dphy_vendor[i] == PHY_VENDOR_SAMSUNG) {
 			dphy->samsung_phy = (struct samsung_mipi_dcphy *)dphy->phy_hw[i];
-			if (dphy->samsung_phy && dphy->samsung_phy->stream_on)
-				dphy->samsung_phy->stream_on(dphy, sd);
+			if (dphy->samsung_phy && dphy->samsung_phy->stream_on) {
+				ret = dphy->samsung_phy->stream_on(dphy, sd);
+				if (ret < 0)
+					goto stop_started;
+				started[i] = true;
+			}
 		} else {
 			dphy->dphy_hw = (struct csi2_dphy_hw *)dphy->phy_hw[i];
-			if (dphy->dphy_hw && dphy->dphy_hw->stream_on)
-				dphy->dphy_hw->stream_on(dphy, sd);
+			if (dphy->dphy_hw && dphy->dphy_hw->stream_on) {
+				ret = dphy->dphy_hw->stream_on(dphy, sd);
+				if (ret < 0)
+					goto stop_started;
+				started[i] = true;
+			}
 		}
 	}
 
 	dphy->is_streaming = true;
 
 	return 0;
+
+stop_started:
+	/* The failed instance has not incremented stream_cnt.  Stop only
+	 * earlier instances whose stream_on actually completed successfully.
+	 */
+	while (--i >= 0) {
+		if (!started[i])
+			continue;
+		if (dphy->csi_info.dphy_vendor[i] == PHY_VENDOR_SAMSUNG) {
+			dphy->samsung_phy = (struct samsung_mipi_dcphy *)dphy->phy_hw[i];
+			if (dphy->samsung_phy->stream_off)
+				dphy->samsung_phy->stream_off(dphy, sd);
+		} else {
+			dphy->dphy_hw = (struct csi2_dphy_hw *)dphy->phy_hw[i];
+			if (dphy->dphy_hw->stream_off)
+				dphy->dphy_hw->stream_off(dphy, sd);
+		}
+	}
+detach_hw:
+	/* update_config attached all instances before start was called. */
+	if (dphy->drv_data->chip_id != CHIP_ID_RK3568 &&
+	    dphy->drv_data->chip_id != CHIP_ID_RV1106)
+		for (i = 0; i < dphy->csi_info.csi_num; i++)
+			rockchip_csi2_dphy_detach_hw(dphy,
+						   dphy->csi_info.csi_idx[i], i);
+	return ret;
 }
 
 static int csi2_dphy_s_stream_stop(struct v4l2_subdev *sd)
@@ -652,6 +687,8 @@ static int csi2_dphy_s_stream(struct v4l2_subdev *sd, int on)
 			return ret;
 		}
 		ret = csi2_dphy_s_stream_start(sd);
+		if (ret < 0)
+			csi2_dphy_disable_clk(dphy);
 	} else {
 		if (!dphy->is_streaming) {
 			mutex_unlock(&dphy->mutex);
@@ -1191,6 +1228,25 @@ static int rockchip_csi2_dphy_probe(struct platform_device *pdev)
 	csi2dphy->phy_index = of_alias_get_id(dev->of_node, drv_data->dev_name);
 	if (csi2dphy->phy_index < 0 || csi2dphy->phy_index >= PHY_MAX)
 		csi2dphy->phy_index = 0;
+
+	/* Optional board-level override.  Preserve hardware defaults entirely
+	 * when absent; phase 0 is a valid explicit setting, not the default.
+	 */
+	if (of_find_property(dev->of_node, "rockchip,clk-phase", NULL)) {
+		if (drv_data->chip_id != CHIP_ID_RK3576)
+			return dev_err_probe(dev, -EINVAL,
+					     "clk-phase is supported only on RK3576\n");
+		if (of_property_count_u32_elems(dev->of_node,
+					      "rockchip,clk-phase") != 1)
+			return dev_err_probe(dev, -EINVAL,
+					     "clk-phase must contain one value in 0..7\n");
+		ret = of_property_read_u32(dev->of_node, "rockchip,clk-phase",
+					   &csi2dphy->clk_phase);
+		if (ret || csi2dphy->clk_phase > 7)
+			return dev_err_probe(dev, -EINVAL,
+					     "clk-phase must be in 0..7\n");
+		csi2dphy->clk_phase_set = true;
+	}
 
 	ret = rockchip_csi2_dphy_get_hw(csi2dphy);
 	if (ret)

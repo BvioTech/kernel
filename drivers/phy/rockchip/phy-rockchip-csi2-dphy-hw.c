@@ -54,6 +54,8 @@
 				CSI2_DPHY_CTRL_INVALID_OFFSET
 #define CSI2_DPHY_CTRL_LANE_ENABLE	(0x00)
 #define CSI2_DPHY_CLK1_LANE_EN		(0x2C)
+#define CSI2_DPHY_CLK_PHASE		(0x38)
+#define CSI2_DPHY_CLK_PHASE_MASK		GENMASK(6, 4)
 #define CSI2_DPHY_DUAL_CAL_EN		(0x80)
 #define CSI2_DPHY_CLK_INV		(0X84)
 
@@ -222,6 +224,7 @@ enum csi2dphy_reg_id {
 	CSI2PHY_CLK_INV,
 	CSI2PHY_CLK_CONTINUE_MODE,
 	CSI2PHY_CLK1_CONTINUE_MODE,
+	CSI2PHY_CLK_PHASE,
 };
 
 #define HIWORD_UPDATE(val, mask, shift) \
@@ -417,6 +420,7 @@ static const struct grf_reg rk3588_grf_dphy_regs[] = {
 };
 
 static const struct csi2dphy_reg rk3588_csi2dphy_regs[] = {
+	[CSI2PHY_CLK_PHASE] = CSI2PHY_REG(CSI2_DPHY_CLK_PHASE),
 	[CSI2PHY_REG_CTRL_LANE_ENABLE] = CSI2PHY_REG(CSI2_DPHY_CTRL_LANE_ENABLE),
 	[CSI2PHY_DUAL_CLK_EN] = CSI2PHY_REG(CSI2_DPHY_DUAL_CAL_EN),
 	[CSI2PHY_CLK_THS_SETTLE] = CSI2PHY_REG(CSI2_DPHY_CLK_WR_THS_SETTLE),
@@ -755,6 +759,7 @@ static int csi2_dphy_hw_stream_on(struct csi2_dphy *dphy,
 	int num_hsfreq_ranges = drv_data->num_hsfreq_ranges;
 	int i, hsfreq = 0;
 	u32 val = 0, pre_val = 0;
+	u32 phase_before = 0, phase_early = 0, phase_lanes = 0;
 	u8 lvds_width = 0;
 
 	if (!sensor_sd)
@@ -765,6 +770,34 @@ static int csi2_dphy_hw_stream_on(struct csi2_dphy *dphy,
 
 	mutex_lock(&hw->mutex);
 
+	/* Validate the opt-in before changing hardware.  The failure cleanup
+	 * below owns this full-lane instance and must not reset another user.
+	 */
+	if (dphy->clk_phase_set) {
+		if (drv_data->chip_id != CHIP_ID_RK3576 ||
+		    hw->lane_mode != LANE_MODE_FULL) {
+			dev_err(dphy->dev, "clk-phase requires RK3576 full-lane mode\n");
+			mutex_unlock(&hw->mutex);
+			return -EINVAL;
+		}
+		if (atomic_read(&hw->stream_cnt)) {
+			dev_err(dphy->dev, "clk-phase cannot reconfigure an active PHY\n");
+			mutex_unlock(&hw->mutex);
+			return -EBUSY;
+		}
+
+		/* Match stream_off's full-lane disable before digital reset.
+		 * The requested phase must be established before RX lanes open.
+		 */
+		write_csi2_dphy_reg(hw, CSI2PHY_REG_CTRL_LANE_ENABLE, 0x01);
+		read_csi2_dphy_reg(hw, CSI2PHY_REG_CTRL_LANE_ENABLE, &val);
+		if (val & GENMASK(6, 2)) {
+			dev_err(dphy->dev, "clk-phase cannot disable RX lanes: 0x%08x\n",
+				val);
+			goto err_clk_phase;
+		}
+	}
+
 	/* Reset dphy digital part */
 	if (hw->lane_mode == LANE_MODE_FULL) {
 		write_csi2_dphy_reg(hw, CSI2PHY_DUAL_CLK_EN, 0x1e);
@@ -774,6 +807,28 @@ static int csi2_dphy_hw_stream_on(struct csi2_dphy *dphy,
 		if (!(val & CSI2_DPHY_LANE_DUAL_MODE_EN)) {
 			write_csi2_dphy_reg(hw, CSI2PHY_DUAL_CLK_EN, 0x5e);
 			write_csi2_dphy_reg(hw, CSI2PHY_DUAL_CLK_EN, 0x5f);
+		}
+	}
+
+	if (dphy->clk_phase_set) {
+		/* Digital reset may restore the hardware phase default.  Program
+		 * the opt-in setting only after reset, with all RX lanes closed.
+		 */
+		read_csi2_dphy_reg(hw, CSI2PHY_REG_CTRL_LANE_ENABLE, &phase_lanes);
+		if (phase_lanes & GENMASK(6, 2)) {
+			dev_err(dphy->dev, "clk-phase RX lanes active after reset: 0x%08x\n",
+				phase_lanes);
+			goto err_clk_phase;
+		}
+		read_csi2_dphy_reg(hw, CSI2PHY_CLK_PHASE, &phase_before);
+		write_csi2_dphy_reg_mask(hw, CSI2PHY_CLK_PHASE,
+					dphy->clk_phase << 4,
+					CSI2_DPHY_CLK_PHASE_MASK);
+		read_csi2_dphy_reg(hw, CSI2PHY_CLK_PHASE, &phase_early);
+		if ((phase_early & CSI2_DPHY_CLK_PHASE_MASK) !=
+		    (dphy->clk_phase << 4)) {
+			dev_err(dphy->dev, "clk-phase pre-enable readback mismatch\n");
+			goto err_clk_phase;
 		}
 	}
 
@@ -872,6 +927,25 @@ static int csi2_dphy_hw_stream_on(struct csi2_dphy *dphy,
 
 	if (hw->lane_mode == LANE_MODE_FULL) {
 		csi_mipidphy_wr_ths_settle(hw, hsfreq, CSI2_DPHY_LANE_CLOCK);
+		/* Keep the vendor-stage check, but do not change phase after
+		 * lanes have opened.  Missing board opt-in remains untouched.
+		 */
+		if (dphy->clk_phase_set) {
+			u32 readback = 0;
+
+			read_csi2_dphy_reg(hw, CSI2PHY_CLK_PHASE, &readback);
+			dev_info(dphy->dev,
+				 "clk-phase=%u stage=post-calibration phy_index=%d reg=%pa+0x38 "
+				 "lanes_before_enable=0x%08x phase_before=0x%08x "
+				 "pre_lane_readback=0x%08x retained=0x%08x\n",
+				 dphy->clk_phase, dphy->phy_index, &hw->res->start,
+				 phase_lanes, phase_before, phase_early, readback);
+			if ((readback & CSI2_DPHY_CLK_PHASE_MASK) !=
+			    (dphy->clk_phase << 4)) {
+				dev_err(dphy->dev, "clk-phase changed after lane enable\n");
+				goto err_clk_phase;
+			}
+		}
 		if (sensor->lanes > 0x00)
 			csi_mipidphy_wr_ths_settle(hw, hsfreq, CSI2_DPHY_LANE_DATA0);
 		if (sensor->lanes > 0x01)
@@ -926,6 +1000,13 @@ static int csi2_dphy_hw_stream_on(struct csi2_dphy *dphy,
 	mutex_unlock(&hw->mutex);
 
 	return 0;
+
+err_clk_phase:
+	/* stream_cnt was not incremented; do not call stream_off here. */
+	write_csi2_dphy_reg(hw, CSI2PHY_REG_CTRL_LANE_ENABLE, 0x01);
+	csi2_dphy_hw_do_reset(hw);
+	mutex_unlock(&hw->mutex);
+	return -EIO;
 }
 
 static int csi2_dphy_hw_stream_off(struct csi2_dphy *dphy,
