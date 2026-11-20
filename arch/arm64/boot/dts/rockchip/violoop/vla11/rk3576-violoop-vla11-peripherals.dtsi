@@ -308,6 +308,8 @@
 /* CSI3 is used in its complete four-lane mode; split DPHY4/5 stay disabled. */
 &csi2_dphy3 {
 	status = "okay";
+	/* LT7911EXC four-lane receiver clock sampling phase (0..7). */
+	rockchip,clk-phase = <2>;
 
 	ports {
 		#address-cells = <1>;

@@ -176,7 +176,7 @@ static int csi2_g_mbus_config(struct v4l2_subdev *sd, unsigned int pad_id,
 			      struct v4l2_mbus_config *mbus);
 
 static void csi2_enable(struct csi2_hw *csi2_hw,
-			enum host_type_t host_type)
+			enum host_type_t host_type, bool hold_reset)
 {
 	void __iomem *base = csi2_hw->base;
 	struct csi2_dev *csi2 = csi2_hw->csi2;
@@ -187,6 +187,9 @@ static void csi2_enable(struct csi2_hw *csi2_hw,
 	struct v4l2_subdev *terminal_sensor_sd = NULL;
 	struct rkmodule_hdr_cfg hdr_cfg = {0};
 	int ret = 0;
+
+	if (hold_reset)
+		write_csihost_reg(base, CSIHOST_RESETN, 0);
 
 	csi2_g_mbus_config(&csi2->sd, 0, &mbus);
 	if (mbus.type == V4L2_MBUS_CSI2_DPHY)
@@ -235,7 +238,84 @@ static void csi2_enable(struct csi2_hw *csi2_hw,
 		csi2->is_check_sot_sync = true;
 	}
 
-	write_csihost_reg(base, CSIHOST_RESETN, 1);
+	if (!hold_reset)
+		write_csihost_reg(base, CSIHOST_RESETN, 1);
+}
+
+static bool csi2_vla11_lt7911_phy_first(struct csi2_dev *csi2,
+				       enum host_type_t host_type)
+{
+	struct v4l2_subdev *terminal = NULL;
+
+	if (host_type != RK_CSI_RXHOST ||
+	    csi2->match_data->chip_id != CHIP_RK3576_CSI2 ||
+	    !of_machine_is_compatible("violoop,rk3576-vla11") ||
+	    csi2->csi_info.csi_num != 1 ||
+	    csi2->csi_info.csi_idx[0] != 3)
+		return false;
+
+	get_remote_terminal_sensor(&csi2->sd, &terminal);
+	return terminal && strstr(terminal->name, "LT7911EXC");
+}
+
+static int csi2_start_after_dphy(struct csi2_dev *csi2,
+				enum host_type_t host_type)
+{
+	struct csi2_hw *hw = csi2->csi2_hw[3];
+	u32 held, released;
+	int i, ret;
+
+	/* Both IRQs are disabled by IRQ_NOAUTOEN or the prior stop.
+	 * Keep their disable depth unchanged until the PHY callback succeeds.
+	 */
+	csi2_hw_do_reset(hw);
+	ret = csi2_enable_clks(hw);
+	if (ret)
+		return ret;
+
+	csi2_enable(hw, host_type, true);
+	held = read_csihost_reg(hw->base, CSIHOST_RESETN);
+	if (held & BIT(0)) {
+		dev_err(csi2->dev, "CSI3 HOST reset did not remain asserted\n");
+		ret = -EIO;
+		goto err_host;
+	}
+
+	/* Preserve the first real IRQ accounting after HOST release. */
+	for (i = 0; i < RK_CSI2_ERR_MAX; i++)
+		csi2->err_list[i].cnt = 0;
+
+	ret = v4l2_subdev_call(csi2->src_sd, video, s_stream, 1);
+	ret = (ret && ret != -ENOIOCTLCMD) ? ret : 0;
+	if (ret)
+		goto err_host;
+
+	write_csihost_reg(hw->base, CSIHOST_RESETN, 1);
+	released = read_csihost_reg(hw->base, CSIHOST_RESETN);
+	if (!(released & BIT(0))) {
+		dev_err(csi2->dev, "CSI3 HOST reset release failed\n");
+		ret = -EIO;
+		goto err_upstream;
+	}
+
+	enable_irq(hw->irq1);
+	enable_irq(hw->irq2);
+	dev_info(csi2->dev,
+		 "CSI3 LT7911 startup: upstream configured before HOST release, "
+		 "held=0x%08x released=0x%08x\n", held, released);
+	return 0;
+
+err_upstream:
+	/* The PHY started, but neither IRQ was enabled. */
+	csi2_disable(hw);
+	v4l2_subdev_call(csi2->src_sd, video, s_stream, 0);
+err_host:
+	/* Every failure arrives before either enable_irq.  Preserve the
+	 * existing disable depth so the next successful start can balance it.
+	 */
+	csi2_disable(hw);
+	csi2_disable_clks(hw);
+	return ret;
 }
 
 static int csi2_start(struct csi2_dev *csi2)
@@ -253,6 +333,9 @@ static int csi2_start(struct csi2_dev *csi2)
 	else
 		host_type = RK_CSI_RXHOST;
 
+	if (csi2_vla11_lt7911_phy_first(csi2, host_type))
+		return csi2_start_after_dphy(csi2, host_type);
+
 	for (i = 0; i < csi2->csi_info.csi_num; i++) {
 		csi_idx = csi2->csi_info.csi_idx[i];
 		csi2_hw_do_reset(csi2->csi2_hw[csi_idx]);
@@ -264,7 +347,7 @@ static int csi2_start(struct csi2_dev *csi2)
 		}
 		enable_irq(csi2->csi2_hw[csi_idx]->irq1);
 		enable_irq(csi2->csi2_hw[csi_idx]->irq2);
-		csi2_enable(csi2->csi2_hw[csi_idx], host_type);
+		csi2_enable(csi2->csi2_hw[csi_idx], host_type, false);
 	}
 
 	pr_debug("stream sd: %s\n", csi2->src_sd->name);
